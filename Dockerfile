@@ -1,6 +1,6 @@
 # A股盯盘 — cloud image (FastAPI + in-process background poller)
 FROM python:3.13-slim
-LABEL org.opencontainers.image.source=https://github.com/chjian007-ctrl/a-share-watch
+LABEL org.opencontainers.image.source=https://github.com/chjiantv-hub/a-share-watch
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 TZ=Asia/Shanghai \
     PORT=8080 DATA_DIR=/data SEED_DIR=/srv/seed
 WORKDIR /srv

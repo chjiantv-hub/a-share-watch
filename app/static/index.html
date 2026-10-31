@@ -189,14 +189,15 @@ async function rLimit(){
    <div class="kv"><div class="k">炸板率</div><div class="v">${zbr===null?NA:zbr.toFixed(1)+'%'}</div></div>
    <div class="kv"><div class="k">最高板</div><div class="v up">${zt&&zt.length?Math.max(...zt.map(r=>r.lb)):NA}</div></div>
    <div class="kv"><div class="k">昨涨停今均</div><div class="v">${x.prev?pct(x.prev.avg_pct):NA}</div></div></div>
+   ${x.notes&&Object.keys(x.notes).length?`<div class="meta">已用备用源：${esc(Object.keys(x.notes).map(k=>k+'='+(x.sources||{})[k]).join('；'))}</div>`:''}
    ${x.errors&&Object.keys(x.errors).length?`<div class="meta err">部分池未取到：${esc(JSON.stringify(x.errors))}</div>`:''}${meta(d)}</div>`;
   const list=LSEG=='zt'?zt:LSEG=='zb'?zb:dt;
   h+=`<div class="card"><div class="seg">${[['zt','涨停池'],['zb','炸板池'],['dt','跌停池']].map(s=>`<button class="${LSEG==s[0]?'on':''}" onclick="LSEG='${s[0]}';LSHOW=30;render(true)">${s[1]}</button>`).join('')}</div>`;
   if(!list){ h+=`<div class="empty">未取到</div></div>`; $('#main').innerHTML=h; return; }
   const show=list.slice(0,LSHOW);
-  if(LSEG=='zt') h+=`<div class="scroll"><table><tr><th>名称</th><th>连板</th><th>首封</th><th>封单</th><th>炸</th></tr>`+show.map(r=>`<tr><td><div class="n">${esc(r.name)}</div><div class="c">${r.code} · ${esc(r.industry)} · ${esc(r.stat)}</div></td><td class="up"><b>${r.lb}</b></td><td>${hm(r.first_seal).slice(0,5)}<div class="c">末 ${hm(r.last_seal).slice(0,5)}</div></td><td>${r.seal_yi}亿</td><td>${r.zb_times}</td></tr>`).join('')+'</table></div>';
-  if(LSEG=='zb') h+=`<div class="scroll"><table><tr><th>名称</th><th>涨幅</th><th>首封</th><th>炸</th><th>行业</th></tr>`+show.map(r=>`<tr><td><div class="n">${esc(r.name)}</div><div class="c">${r.code}</div></td><td>${pct(r.pct)}</td><td>${hm(r.first_seal).slice(0,5)}</td><td>${r.zb_times}</td><td>${esc(r.industry)}</td></tr>`).join('')+'</table></div>';
-  if(LSEG=='dt') h+=`<div class="scroll"><table><tr><th>名称</th><th>跌幅</th><th>连跌</th><th>开板</th><th>行业</th></tr>`+show.map(r=>`<tr><td><div class="n">${esc(r.name)}</div><div class="c">${r.code}</div></td><td>${pct(r.pct)}</td><td>${r.cont}</td><td>${r.open_times}</td><td>${esc(r.industry)}</td></tr>`).join('')+'</table></div>';
+  if(LSEG=='zt') h+=`<div class="scroll"><table><tr><th>名称</th><th>连板</th><th>首封</th><th>封单</th><th>炸</th></tr>`+show.map(r=>`<tr><td><div class="n">${esc(r.name)}</div><div class="c">${r.code} · ${esc(r.industry||r.reason||'—')} · ${esc(r.stat)}</div></td><td class="up"><b>${r.lb}</b></td><td>${hm(r.first_seal).slice(0,5)}<div class="c">末 ${hm(r.last_seal).slice(0,5)}</div></td><td>${r.seal_yi==null?'—':r.seal_yi+'亿'}</td><td>${r.zb_times??'—'}</td></tr>`).join('')+'</table></div>';
+  if(LSEG=='zb') h+=`<div class="scroll"><table><tr><th>名称</th><th>涨幅</th><th>首封</th><th>炸</th><th>行业</th></tr>`+show.map(r=>`<tr><td><div class="n">${esc(r.name)}</div><div class="c">${r.code}</div></td><td>${pct(r.pct)}</td><td>${hm(r.first_seal).slice(0,5)}</td><td>${r.zb_times??'—'}</td><td>${esc(r.industry||'—')}</td></tr>`).join('')+'</table></div>';
+  if(LSEG=='dt') h+=`<div class="scroll"><table><tr><th>名称</th><th>跌幅</th><th>连跌</th><th>开板</th><th>行业</th></tr>`+show.map(r=>`<tr><td><div class="n">${esc(r.name)}</div><div class="c">${r.code}</div></td><td>${pct(r.pct)}</td><td>${r.cont??'—'}</td><td>${r.open_times??'—'}</td><td>${esc(r.industry||'—')}</td></tr>`).join('')+'</table></div>';
   if(list.length>LSHOW) h+=`<button class="btn sec more" onclick="LSHOW+=30;render(true)">展开更多（${LSHOW}/${list.length}）</button>`;
   h+=`<div class="meta">封单=封板资金（东财口径，非完整委托队列）</div></div>`;
   $('#main').innerHTML=h;}

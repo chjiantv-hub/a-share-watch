@@ -8,9 +8,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 POOL_DIR = os.environ.get("POOL_DIR", APP_DIR)          # dir holding quotes.py
-sys.path.insert(0, POOL_DIR)
+sys.path.insert(0, POOL_DIR); sys.path.insert(0, APP_DIR) if APP_DIR != POOL_DIR else None
 _argv = sys.argv; sys.argv = [sys.argv[0]]          # quotes.py parses argv at import
 import quotes as Q                                   # noqa: E402
+import pools as P                                    # noqa: E402
 sys.argv = _argv
 import requests                                      # noqa: E402
 from fastapi import FastAPI, Request, HTTPException  # noqa: E402
@@ -165,61 +166,99 @@ def job_breadth():
     b = Q.cmd_breadth()
     put("breadth", b, source="东方财富指数涨跌家数（镜像）+ 乐咕乐股 legu" + ("" if "up" in b else "（东财镜像本次失败，仅乐咕）"))
 
-def _pool(f, date):
-    d = f(date=date)
-    return d if d is not None else None
+def _fill_tx(rows, date):
+    """Fill 成交额 for fallback rows from Tencent quotes, only when Tencent's quote date == pool date."""
+    need = [r for r in rows if r.get("amount") is None]
+    if not need: return 0
+    q = {}
+    for i in range(0, len(need), 60):
+        try: q.update(Q.tx_quotes([Q.tx_sym(r["code"]) for r in need[i:i + 60]]))
+        except Exception as e: log("tx fill fail", e)
+    n = 0
+    for r in need:
+        t = q.get(Q.tx_sym(r["code"]))
+        if t and (t.get("time") or "")[:10].replace("-", "") == date and t.get("amount_yi") is not None:
+            r["amount_yi"] = round(t["amount_yi"], 2); r["amount"] = t["amount_yi"] * 1e8; n += 1
+            if r.get("limit") is None and "limit" in r:
+                r["limit"] = limits(r["code"], r.get("name") or t.get("name"), t.get("pre_close"))[0]
+    return n
+
+def _prev_perf_fallback(rd):
+    """昨日涨停今日表现 without Eastmoney: 同花顺 previous-day 涨停池 + 连板天梯, today's price from Tencent qt
+    (only if Tencent's quote date == rd)."""
+    pd_ = prev_trade_day(rd)
+    rows, _ = P.ths_pool("zt", pd_)
+    q = {}
+    for i in range(0, len(rows), 60): q.update(Q.tx_quotes([Q.tx_sym(r["code"]) for r in rows[i:i + 60]]))
+    out = []
+    for r in rows:
+        t = q.get(Q.tx_sym(r["code"]))
+        if not t or (t.get("time") or "")[:10].replace("-", "") != rd or t.get("price") is None or t.get("pre_close") is None: continue
+        up = limits(r["code"], t.get("name") or r["name"], t["pre_close"])[0]
+        out.append({"code": r["code"], "pct": t["pct"], "price": t["price"], "limit": up, "ylb": r["lb"]})
+    if len(out) < len(rows) * 0.9: raise P.PoolError(f"腾讯行情只对上 {len(out)}/{len(rows)} 只昨日涨停股（行情日期≠{rd}？）")
+    return out, f"同花顺 {pd_} 涨停池 + 腾讯 {rd} 行情（备用）"
+
+def _prev_summary(prev):
+    if not prev: return None
+    pc = [r for r in prev if r.get("pct") is not None]
+    still = [r for r in pc if r.get("price") is not None and r.get("limit") and r["price"] >= r["limit"] - 0.005]
+    lb = [r for r in pc if (r.get("ylb") or 0) >= 2]
+    lb_still = [r for r in lb if r in still]
+    n = len(pc)
+    return {"n": n, "avg_pct": round(sum(r["pct"] for r in pc) / n, 2) if n else None, "up": sum(r["pct"] > 0 for r in pc),
+            "down": sum(r["pct"] < 0 for r in pc), "still_zt": len(still), "promo_rate": round(len(still) / n * 100, 1) if n else None,
+            "lb_n": len(lb), "lb_still": len(lb_still), "lb_promo_rate": round(len(lb_still) / len(lb) * 100, 1) if lb else None,
+            "lb_avg_pct": round(sum(r["pct"] for r in lb) / len(lb), 2) if lb else None}
+
 def job_limitup():
-    import akshare as ak
     rd = ref_day()
     with ThreadPoolExecutor(4) as ex:
-        futs = {k: ex.submit(_pool, f, rd) for k, f in (("zt", ak.stock_zt_pool_em), ("dt", ak.stock_zt_pool_dtgc_em),
-                                                          ("zb", ak.stock_zt_pool_zbgc_em), ("prev", ak.stock_zt_pool_previous_em))}
+        futs = {k: ex.submit(P.get_pool, k, rd) for k in ("zt", "dt", "zb", "prev")}
         res = {}
         for k, fu in futs.items():
             try: res[k] = fu.result()
             except Exception as e: res[k] = e
-    errs = {k: f"{type(v).__name__}: {v}"[:160] for k, v in res.items() if isinstance(v, Exception)}
+    if isinstance(res["prev"], Exception):
+        em_err = res["prev"]
+        try: rows, src = _prev_perf_fallback(rd); res["prev"] = (rows, src, f"东财失败：{em_err}")
+        except Exception as e: res["prev"] = P.PoolError(f"东财：{em_err} | 备用：{e}")
+    errs = {k: f"{type(v).__name__}: {v}"[:300] for k, v in res.items() if isinstance(v, Exception)}
     if "zt" in errs and "dt" in errs: raise RuntimeError(f"涨停/跌停池均失败 {errs}")
-    out = {"date": rd, "errors": errs}
-    zt, dtp, zb, prev = (res[k] if not isinstance(res[k], Exception) else None for k in ("zt", "dt", "zb", "prev"))
-    if zt is not None:
-        z = zt.sort_values(["连板数", "首次封板时间"], ascending=[False, True]) if len(zt) else zt
-        out["zt"] = [{"code": r["代码"], "name": r["名称"], "lb": int(r["连板数"]), "stat": r["涨停统计"], "first_seal": r["首次封板时间"],
-                      "last_seal": r["最后封板时间"], "zb_times": int(r["炸板次数"]), "seal_yi": round(r["封板资金"] / 1e8, 2),
-                      "amount_yi": round(r["成交额"] / 1e8, 2), "turnover": round(float(r["换手率"]), 1), "mcap_yi": round(r["流通市值"] / 1e8, 1),
-                      "price": float(r["最新价"]), "pct": round(float(r["涨跌幅"]), 2), "industry": r["所属行业"]} for _, r in z.iterrows()]
-    if zb is not None:
-        out["zb"] = [{"code": r["代码"], "name": r["名称"], "price": float(r["最新价"]), "pct": round(float(r["涨跌幅"]), 2), "limit": float(r["涨停价"]),
-                      "first_seal": r["首次封板时间"], "zb_times": int(r["炸板次数"]), "amount_yi": round(r["成交额"] / 1e8, 2),
-                      "amplitude": round(float(r["振幅"]), 1), "industry": r["所属行业"]} for _, r in zb.iterrows()]
-    if dtp is not None:
-        out["dt"] = [{"code": r["代码"], "name": r["名称"], "price": float(r["最新价"]), "pct": round(float(r["涨跌幅"]), 2), "cont": int(r["连续跌停"]),
-                      "open_times": int(r["开板次数"]), "seal_yi": round(r["封单资金"] / 1e8, 3), "amount_yi": round(r["成交额"] / 1e8, 2),
-                      "industry": r["所属行业"]} for _, r in dtp.iterrows()]
-    if prev is not None and len(prev):
-        p = prev["涨跌幅"]; still = prev["最新价"] >= prev["涨停价"] - 0.005
-        lb = prev[prev["昨日连板数"] >= 2]; lb_still = lb["最新价"] >= lb["涨停价"] - 0.005
-        out["prev"] = {"n": len(prev), "avg_pct": round(float(p.mean()), 2), "up": int((p > 0).sum()), "down": int((p < 0).sum()),
-                       "still_zt": int(still.sum()), "promo_rate": round(still.sum() / len(prev) * 100, 1),
-                       "lb_n": len(lb), "lb_still": int(lb_still.sum()), "lb_promo_rate": round(lb_still.sum() / len(lb) * 100, 1) if len(lb) else None,
-                       "lb_avg_pct": round(float(lb["涨跌幅"].mean()), 2) if len(lb) else None}
-    put("limitup", out, source="东方财富涨停板行情 push2ex（akshare stock_zt_pool_*_em）")
+    out = {"date": rd, "errors": errs, "sources": {}, "notes": {}}
+    names = {"zt": "涨停", "dt": "跌停", "zb": "炸板", "prev": "昨涨停表现"}
+    for k, v in res.items():
+        if isinstance(v, Exception): continue
+        rows, src, note = v
+        out["sources"][k] = src
+        if note: out["notes"][k] = note[:300]
+        if k == "prev": out["prev"] = _prev_summary(rows); continue
+        if src != P.EM_LABEL and k in ("zt", "zb", "dt"): _fill_tx(rows, rd)
+        if k == "zt": rows = sorted(rows, key=lambda r: (-(r["lb"] or 0), r["first_seal"] or "999999"))
+        out[k] = rows
+    srcs = sorted(set(out["sources"].values()))
+    put("limitup", out, source="；".join(f"{names[k]}={'东财' if v == P.EM_LABEL else '同花顺备用'}" for k, v in out["sources"].items())
+        + ("（" + " / ".join(srcs) + "）"))
 
 def job_prevpools():
     """Previous trading day's pools: auction candidates + 跌停 two-day check."""
-    import akshare as ak
     rd = ref_day(); pd_ = prev_trade_day(rd)
     cur = get("prevpools").get("data") or {}
-    if cur.get("date") == pd_ and cur.get("zt") is not None: return
-    zt = ak.stock_zt_pool_em(date=pd_); time.sleep(1); zb = ak.stock_zt_pool_zbgc_em(date=pd_); time.sleep(1)
-    try: dtn = len(ak.stock_zt_pool_dtgc_em(date=pd_))
+    if cur.get("date") == pd_ and cur.get("zt") is not None and cur.get("src_zt") == P.EM_LABEL: return
+    if cur.get("date") == pd_ and cur.get("zt") is not None and P.em_cooling(): return
+    zt, src_zt, _ = P.get_pool("zt", pd_); time.sleep(1)
+    try: zb, src_zb, _ = P.get_pool("zb", pd_)
+    except Exception as e: zb, src_zb = None, f"未取到：{e}"[:200]
+    time.sleep(1)
+    try: dtn = len(P.get_pool("dt", pd_)[0])
     except Exception: dtn = None
-    put("prevpools", {"date": pd_, "for_day": rd, "dt_count": dtn, "zt_count": len(zt),
-                      "zt": [{"code": r["代码"], "name": r["名称"], "lb": int(r["连板数"]), "zb_times": int(r["炸板次数"]), "last_seal": r["最后封板时间"],
-                              "first_seal": r["首次封板时间"], "amount": float(r["成交额"]), "industry": r["所属行业"]} for _, r in zt.iterrows()],
-                      "zb": [{"code": r["代码"], "name": r["名称"], "zb_times": int(r["炸板次数"]), "amount": float(r["成交额"]),
-                              "industry": r["所属行业"]} for _, r in zb.iterrows()]},
-        source=f"东方财富涨停/炸板池 {pd_}")
+    put("prevpools", {"date": pd_, "for_day": rd, "dt_count": dtn, "zt_count": len(zt), "src_zt": src_zt, "src_zb": src_zb,
+                      "zt": [{"code": r["code"], "name": r["name"], "lb": r["lb"] if r["lb"] is not None else 1, "zb_times": r["zb_times"] or 0,
+                              "last_seal": r["last_seal"] or "", "first_seal": r["first_seal"] or "", "amount": r["amount"],
+                              "industry": r["industry"]} for r in zt],
+                      "zb": [{"code": r["code"], "name": r["name"], "zb_times": r["zb_times"] or 0, "amount": r["amount"],
+                              "industry": r["industry"]} for r in (zb or [])]},
+        source=f"涨停/炸板池 {pd_}：涨停={src_zt}；炸板={src_zb}")
 
 # ---- spot + alerts ----
 def rule_codes(): return sorted({r["code"] for r in jload(RULES_F, [])})
@@ -480,7 +519,7 @@ def job_auction():
                     "must_empty": sent.get("must_empty"), "position": sent.get("position"),
                     "buy_points_active": sent.get("buy_points_active"), "buy_points_paused": sent.get("buy_points_paused")},
         source=("腾讯快照 qt.gtimg.cn（9:25-9:30 竞价撮合价/额）" if mode == "live" else "腾讯分时首根 09:30 bar（=开盘集合竞价撮合）")
-               + f"；候选=自选+{pp.get('date')}涨停/炸板池（东方财富）")
+               + f"；候选=自选+{pp.get('date')}涨停/炸板池（{pp.get('src_zt') or '东方财富'}）")
 
 # ---------------- sentiment ----------------
 def sentiment():
@@ -655,6 +694,8 @@ def meta(key):
 def api_status():
     return {"now": nows(), "phase": phase(), "phase_cn": PHASE_CN[phase()], "trade_day": is_trade_day(), "ref_day": ref_day(),
             "jobs": {k: {**meta(k), "last_run": LASTRUN.get(k), "interval_s": interval(k)} for k in JOBS}}
+@app.get("/api/diag")
+def api_diag(): return {"now": nows(), "probe": P.probe()}
 @app.get("/api/watch")
 def api_watch():
     s = get("spot"); rows = (s.get("data") or {}).get("rows", {}); wl = read_watch()
