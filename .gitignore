@@ -4,3 +4,4 @@ data/
 deploy.env
 *.log
 .localdata/
+__pycache__/

@@ -21,13 +21,13 @@
 1. 浏览器：登录 GitHub → Settings → Developer settings → Personal access tokens (classic) → 新建，勾选 `repo`、`workflow`、`write:packages`（另建一个只勾 `read:packages` 的给 ClawCloud 拉镜像用）。
 2. 在本机：`GH_TOKEN=ghp_xxx ./deploy.sh`
    - 创建**私有**仓库 `<用户名>/a-share-watch` 并推送；
-   - 构建并推送镜像 `ghcr.io/<用户名小写>/a-share-watch:latest`（本机有 docker 就直接推，否则由仓库里的 GitHub Action 自动构建，约 3 分钟）。
+   - 构建并推送镜像 `ghcr.io/<用户名小写>/a-share-watch-cloud:latest`（本机有 docker 就直接推，否则由仓库里的 GitHub Action 自动构建，约 3 分钟）。
    - 令牌不会写进仓库或镜像。
 
 ## 第 2A 步：ClawCloud Run（首选）——需要浏览器
 1. 打开 https://run.claw.cloud → 用 **GitHub 登录**（这一步即完成注册并绑定 GitHub，无需信用卡）→ 右上角区域选 **Japan**。
 2. App Launchpad → Create App：
-   - Image：Private；Image Name `ghcr.io/<用户名小写>/a-share-watch:latest`；Registry `ghcr.io`；Username = GitHub 用户名；Password = read:packages 令牌
+   - Image：Private；Image Name `ghcr.io/<用户名小写>/a-share-watch-cloud:latest`；Registry `ghcr.io`；Username = GitHub 用户名；Password = read:packages 令牌
    - Usage: Fixed，Replicas 1，CPU 0.25（或 0.2），Memory 512M
    - Network：Container Port `8080`，打开 Public Access（自动生成 https 域名）
    - Environment：`ACCESS_TOKEN=<现有令牌>`，`WATCHLIST_SEED=<自选代码,逗号分隔>`

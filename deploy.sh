@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Push this folder to a GitHub repo (public by default) and publish the image ghcr.io/<owner>/a-share-watch:latest.
+# Push this folder to a GitHub repo (public by default) and publish the image ghcr.io/<owner>/a-share-watch-cloud:latest.
 #   Needs only:  GH_TOKEN=<GitHub classic PAT with scopes: repo, workflow, write:packages>  ./deploy.sh
 # Optional env: REPO_NAME (default a-share-watch), VISIBILITY public|private (default public: repo holds no token or personal data)
 # After it finishes:
@@ -13,7 +13,7 @@ export GH_TOKEN
 REPO_NAME=${REPO_NAME:-a-share-watch}
 OWNER=$(gh api user -q .login)
 OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
-IMG=ghcr.io/$OWNER_LC/$REPO_NAME
+IMG=ghcr.io/$OWNER_LC/a-share-watch-cloud
 echo "GitHub user: $OWNER"
 gh repo view "$OWNER/$REPO_NAME" >/dev/null 2>&1 || gh repo create "$OWNER/$REPO_NAME" --${VISIBILITY:-public} -d "A股盯盘 (cloud deploy)" >/dev/null
 [ -d .git ] || git init -q -b main

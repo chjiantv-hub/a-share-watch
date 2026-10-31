@@ -1,4 +1,4 @@
-# Builds the Docker image on every push to main and publishes ghcr.io/<owner>/a-share-watch:latest (for ClawCloud Run).
+# Builds the Docker image on every push to main and publishes ghcr.io/<owner>/a-share-watch-cloud:latest (for ClawCloud Run).
 name: build-image
 on:
   push: { branches: [main] }
@@ -12,7 +12,7 @@ jobs:
       - uses: docker/login-action@v3
         with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
       - id: n
-        run: echo "img=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/a-share-watch" >> "$GITHUB_OUTPUT"
+        run: echo "img=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/a-share-watch-cloud" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
