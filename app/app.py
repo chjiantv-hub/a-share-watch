@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A股盯盘 v1 — FastAPI backend + background poller.
+"""高高在上（原 A股盯盘）v1 — FastAPI backend + background poller.
 Data via bundled quotes.py helpers (Tencent qt / ifzq, Eastmoney mirrors, akshare push2ex pools, legu).
 NOT Level-2. All times Beijing (UTC+8)."""
 import os, sys, json, time, uuid, hmac, threading, traceback, re, datetime as dt
@@ -1075,7 +1075,7 @@ def sw(): return FileResponse(os.path.join(STATIC, "sw.js"), media_type="applica
 def icon(): return FileResponse(os.path.join(STATIC, "icon.png"), media_type="image/png")
 @app.get("/manifest.webmanifest")
 def manifest():
-    return JSONResponse({"name": "A股盯盘", "short_name": "A股盯盘", "start_url": f"/?t={TOKEN}", "scope": "/", "display": "standalone",
+    return JSONResponse({"name": "高高在上", "short_name": "高高在上", "start_url": f"/?t={TOKEN}", "scope": "/", "display": "standalone",
                          "background_color": "#0b0f14", "theme_color": "#0b0f14",
                          "icons": [{"src": "/icon.png", "sizes": "512x512", "type": "image/png"}]}, media_type="application/manifest+json")
 
@@ -1115,7 +1115,7 @@ async def add_watch(req: Request):
         q = Q.tx_quotes([Q.tx_sym(c)]).get(Q.tx_sym(c))
     except Exception: q = None
     if not q: raise HTTPException(404, f"未查到 {c} 的行情，请核对代码")
-    rows.append({"code": c, "name": q["name"], "board": board_of(c, q["name"])[0], "note": f"盯盘App添加 {now():%m/%d}"})
+    rows.append({"code": c, "name": q["name"], "board": board_of(c, q["name"])[0], "note": f"高高在上添加 {now():%m/%d}"})
     write_watch(rows); NEXT["spot"] = NEXT["minutes"] = 0
     return {"ok": True, "name": q["name"]}
 @app.delete("/api/watchlist/{code}")
