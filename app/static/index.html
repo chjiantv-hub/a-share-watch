@@ -28,6 +28,7 @@ nav button b{font-size:20px;font-weight:700;line-height:1}
 nav button.on{color:var(--acc)}
 .card{background:var(--card);border-radius:14px;padding:12px;margin-bottom:10px}
 .card h2{font-size:15px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.cat{margin-top:6px;font-size:12px;line-height:1.45}.cat .ci{margin-top:3px;word-break:break-all}.cat a{color:#8fb8ff;text-decoration:none}
 .meta{font-size:11px;color:var(--mut);margin-top:8px;word-break:break-all;line-height:1.4}
 .meta.err{color:var(--warn)}
 .up{color:var(--up)}.dn{color:var(--dn)}.mut{color:var(--mut)}
@@ -477,6 +478,23 @@ const PCONC={入观察池:'yes',仅参考:'hold',剔除:'no',可建仓:'yes',只
 function fcLink(code){
   return `<a class="btn mini sec" href="/fivecore/?t=${encodeURIComponent(TK)}#analyze=${code}" onclick="event.stopPropagation()">五核</a>`;
 }
+const CATK={pass:'yes',user:'yes',exclude:'no',unverified:'hold'};
+const CATC={正面:'yes',负面:'no',风险:'watch',中性:'na'};
+function catHtml(c, flag, kind){
+  const f=flag||(c&&c.flag); if(!f && !c) return '';
+  const k=kind||(c&&c.flag_kind)||'unverified';
+  let h=`<div class="cat"><span class="tag t-${CATK[k]||'hold'}">${esc(f||'未核验')}</span>`;
+  const top=(c&&c.top)||[];
+  if(top.length){
+    h+=top.slice(0,3).map(x=>`<div class="ci"><span class="tag t-${CATC[x.cls]||'na'}">${esc(x.cls)}${x.label?'·'+esc(x.label):''}</span>`+
+      (x.url?`<a href="${esc(x.url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(x.title)}</a>`:esc(x.title))+
+      ` <span class="c">${esc(x.date||'')} · ${esc(x.source||'')}</span></div>`).join('');
+  } else if(c && c.reason && c.status!=='ok'){
+    h+=`<div class="ci c">${esc(c.reason)}</div>`;
+  }
+  if(c && c.fetched_at) h+=`<div class="ci c">抓取于 ${esc(c.fetched_at)}${c.ann_source?' · 公告源 '+esc(c.ann_source):''}${c.window?' · 区间 '+esc(c.window):''}</div>`;
+  return h+`</div>`;
+}
 async function poolNote(code, action){
   try{ await api('/api/pool/note',{method:'POST',body:JSON.stringify({code,action})}); toast(action+' · '+code); render(true);}catch(e){toast(e.message)}
 }
@@ -506,9 +524,9 @@ async function rPool(){
         <div class="c">${esc(r.theme||'')} · ${esc(r.industry||'')} · ${r.lb||'—'}板 · 额 ${r.amount_yi??'—'}亿</div>
         <div style="margin-top:4px"><span class="tag t-${cc}">${esc(r.conclusion_for_observe)}</span>
         ${r.planned_buy_point&&r.planned_buy_point!=='—'?'<span class="tag">'+esc(r.planned_buy_point)+'</span>':''}
-        ${(r.pass_flags&&r.pass_flags.catalytic)?`<span class="tag t-hold">${esc(r.pass_flags.catalytic)}</span>`:''}
         ${r.lanban?'<span class="tag t-watch">烂板/尾盘</span>':''}</div></div>
         <div>${fcLink(r.code)}</div></div>
+        ${catHtml(r.catalyst, r.pass_flags&&r.pass_flags.catalytic, r.pass_flags&&r.pass_flags.catalytic_kind)}
         <div class="c" style="margin-top:6px">关注价：昨收 ${(r.watch_prices&&r.watch_prices['昨收'])??'未取到'} · 昨低 ${(r.watch_prices&&r.watch_prices['昨低'])??'未取到'}
         · 市值 ${(r.pass_flags&&r.pass_flags.float_cap_yi)!=null?r.pass_flags.float_cap_yi+'亿':(r.pass_flags&&r.pass_flags.cap_ok==='unknown'?'未知':'—')}</div>
         <div class="reason">${(r.reasons||[]).map(esc).join('；')}</div>
@@ -533,9 +551,9 @@ async function rPool(){
       <div class="sub">${esc(w.observe_conclusion||'—')} · ${esc(w.board||'')}</div></div>${fcLink(w.code)}</div>`).join('');
     const rej=obs.rejected||[];
     h+=`<details style="margin-top:12px"><summary>已剔除 / 未入选（${rej.length}）</summary>`;
-    h+=rej.slice(0,40).map(r=>`<div class="ev"><div class="t">${esc(r.code)}</div><div><b>${esc(r.name||'')}</b> · ${esc(r.industry||'')}<div class="c">${esc((r.reasons||[]).join('；'))}</div></div></div>`).join('')||`<div class="empty">无</div>`;
+    h+=rej.slice(0,40).map(r=>`<div class="ev"><div class="t">${esc(r.code)}</div><div><b>${esc(r.name||'')}</b> · ${esc(r.industry||'')}<div class="c">${esc((r.reasons||[]).filter(Boolean).join('；'))}</div>${r.catalyst?catHtml(r.catalyst):''}</div></div>`).join('')||`<div class="empty">无</div>`;
     h+=`</details>`;
-    h+=`<div class="meta">规则：主线行业涨停≥5（不足则≥3为候选）；成交额≥5亿硬条件；流通市值约50-500亿软条件；催化默认未核验。退潮期只偏向新方向首板弱转强。</div>${meta(d.observe)}</div>`;
+    h+=`<div class="meta">规则：主线行业涨停≥5（不足则≥3为候选）；成交额≥5亿硬条件；流通市值约50-500亿软条件。催化依据近约10个交易日公告/资讯标题自动判断：监管问询/立案、ST、业绩预亏、减持直接剔除；解禁、风险提示、澄清等保持未核验；抓取失败即未核验并注明原因；「催化已核验」以用户核验为准。退潮期只偏向新方向首板弱转强。</div>${obs.catalyst_status?`<div class="meta">催化抓取：缓存 ${obs.catalyst_status.cached??'—'} · 进行中 ${obs.catalyst_status.inflight??0} · ${esc(obs.catalyst_status.sources_order||'')}</div>`:''}${meta(d.observe)}</div>`;
   }
 
   if(PSEG==='auc'){
@@ -555,6 +573,7 @@ async function rPool(){
           ${r.buy_point&&r.buy_point!=='—'?'<span class="tag">'+esc(r.buy_point)+'</span>':''}</div></div>
           <div class="pct ${cls(r.pct)}">${r.pct==null?'—':((r.pct>0?'+':'')+Number(r.pct).toFixed(2)+'%')}</div></div>
           <div class="reason">${esc(r.reason||'')}</div>
+          ${r.catalyst?catHtml(r.catalyst):''}
           <div style="margin-top:6px">${fcLink(r.code)}</div></div>`;
       }).join('');
       h+=`<button class="btn sec more" onclick="go('auction')">打开完整竞价页</button></div>`;
@@ -578,6 +597,7 @@ async function rPool(){
           <div style="margin-top:4px"><span class="tag t-${cc}">${esc(r.conclusion||'未取到')}</span></div></div></div>
           <div class="c" style="margin-top:6px">开${m.open??'—'} · 09:40 ${m.last_0940??'—'} · 高${m.high??'—'} · 量较昨 ${m.vol_vs_yest??'未取到'}</div>
           <div class="reason">${esc(r.reason||'')}</div>
+          ${r.catalyst?catHtml(r.catalyst):''}
           <div style="margin-top:6px">${fcLink(r.code)}</div></div>`;
       }).join('')||`<div class="empty">无重点股</div>`;
       h+=`${meta(d.open_confirm)}</div>`;

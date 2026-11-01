@@ -13,6 +13,7 @@ _argv = sys.argv; sys.argv = [sys.argv[0]]          # quotes.py parses argv at i
 import quotes as Q                                   # noqa: E402
 import pools as P                                    # noqa: E402
 import pool_select as PS                             # noqa: E402
+import catalyst as CATM                              # noqa: E402
 sys.argv = _argv
 import requests                                      # noqa: E402
 from fastapi import FastAPI, Request, HTTPException  # noqa: E402
@@ -26,6 +27,16 @@ if not os.path.exists(WATCH_MD) and os.path.exists(os.path.join(SEED_DIR, "watch
     import shutil; shutil.copy(os.path.join(SEED_DIR, "watchlist.md"), WATCH_MD)
 RULES_F = os.path.join(DATA, "rules.json"); EVENTS_F = os.path.join(DATA, "alert_log.json")
 TRADE_POOL_F = os.path.join(DATA, "trade_pool.json")
+CAT_ENABLED = os.environ.get("CATALYST_FETCH", "1").strip() not in ("0", "false", "off")
+CAT_MAX_CODES = 20            # 每轮观察池最多抓取的候选数
+CAT_WAIT_S = 8.0              # job_observe 内最多等待的秒数（之后后台继续，完成后触发重建）
+def _cat_updated():
+    # 抓取完成后 15 秒内合并重建观察池（批量合并，避免频繁重算）
+    try:
+        t = time.time() + 15
+        if NEXT.get("observe", 0) > t: NEXT["observe"] = t
+    except Exception: pass
+CAT = CATM.CatalystService(os.path.join(DATA, "catalyst"), workers=4, on_update=_cat_updated)
 TOKEN_F = os.path.join(DATA, "token.txt")
 BJ = Q.BJ
 LOCK = threading.RLock()
@@ -849,9 +860,22 @@ def job_observe():
     if tp_mem.get("day") == day and tp_mem.get("notes"):
         notes = {**notes, **(tp_mem.get("notes") or {})}
 
-    out = PS.build_observe_pool(
-        zt, stage_mode=stage, tier=sent.get("tier"), sectors=sectors if isinstance(sectors, dict) else None,
-        float_caps=caps, watchlist=read_watch(), user_notes=notes, pool_day=day, position=sent.get("position"))
+    kw = dict(stage_mode=stage, tier=sent.get("tier"), sectors=sectors if isinstance(sectors, dict) else None,
+              float_caps=caps, watchlist=read_watch(), user_notes=notes, pool_day=day, position=sent.get("position"))
+    out = PS.build_observe_pool(zt, **kw)
+    cat_note = "催化默认未核验（自动抓取已关闭）"
+    if CAT_ENABLED:
+        # 候选（通过硬性条件、按排序）+ 自选：后台抓公告/资讯，限时等待，未完成者标「抓取中/超时」
+        pairs = list(dict.fromkeys(tuple(x) for x in out.get("candidates_ranked") or []))[:CAT_MAX_CODES]
+        cats = CAT.ensure(day, pairs, wait_s=CAT_WAIT_S) if pairs else {}
+        wl_pairs = [(w["code"], w.get("name")) for w in read_watch()]
+        if wl_pairs: CAT.ensure(day, wl_pairs, wait_s=0)
+        out = PS.build_observe_pool(zt, **kw, catalysts=cats)
+        pend = sum(1 for v in cats.values() if v.get("status") == "pending")
+        cat_note = f"催化=自动抓取 {len(cats) - pend}/{len(cats)}" + (f"（{pend} 只抓取中）" if pend else "")
+        out["catalyst_status"] = {**CAT.status(), "pending": pend, "n": len(cats),
+                                  "sources_order": "公告：东方财富→巨潮资讯→新浪财经；资讯：东方财富搜索"}
+    out.pop("candidates_ranked", None)
     for r in out.get("observe") or []:
         wp = watch_px.get(r["code"])
         if wp: r["watch_prices"] = wp
@@ -860,12 +884,15 @@ def job_observe():
     out["zt_count"] = len(zt); out["zt_source"] = src
     out["float_cap_source"] = "东方财富 ulist f21 流通市值" if caps else "流通市值未取到"
     out["sectors_meta"] = meta("sectors")
-    put("observe", out, source=f"{src}；板块={meta('sectors').get('source') or '尚未取到'}；流通市值=东财f21；催化默认未核验")
-    # 观察池就绪后，让竞价按「观察池优先」重算
+    prev_codes = {r["code"] for r in (get("observe").get("data") or {}).get("observe") or []}
+    put("observe", out, source=f"{src}；板块={meta('sectors').get('source') or '尚未取到'}；流通市值=东财f21；{cat_note}")
+    # 观察池成员变化后，让竞价按「观察池优先」重算（仅催化标注变化时不重算）
+    new_codes = {r["code"] for r in out.get("observe") or []}
     au = get("auction").get("data")
-    if au:
-        put("auction", {**au, "stale_for_observe": True, "complete": False}, source=get("auction").get("source"))
-    NEXT["auction"] = 0
+    if new_codes != prev_codes:
+        if au:
+            put("auction", {**au, "stale_for_observe": True, "complete": False}, source=get("auction").get("source"))
+        NEXT["auction"] = 0
     # rebuild trade pool skeleton
     tp = PS.merge_trade_pool(day, out, get("auction").get("data"), get("open_confirm").get("data"),
                              prev=jload(TRADE_POOL_F, {}) or tp_mem)
@@ -1041,7 +1068,17 @@ def api_status():
     return {"now": nows(), "phase": phase(), "phase_cn": PHASE_CN[phase()], "trade_day": is_trade_day(), "ref_day": ref_day(),
             "jobs": {k: {**meta(k), "last_run": LASTRUN.get(k), "interval_s": interval(k)} for k in JOBS}}
 @app.get("/api/diag")
-def api_diag(): return {"now": nows(), "probe": P.probe()}
+def api_diag(): return {"now": nows(), "probe": P.probe(), "catalyst": CAT.status() if CAT_ENABLED else {"enabled": False}}
+
+@app.get("/api/catalyst/{code}")
+def api_catalyst(code: str, day: str | None = None, wait: float = 8.0):
+    """单只股票的公告/资讯催化（全部条目）。缓存按池日；未命中则后台抓取并最多等待 wait 秒。"""
+    code = (code or "").strip()
+    if not valid_code(code): raise HTTPException(400, "代码须为6位数字")
+    if not CAT_ENABLED: raise HTTPException(503, "催化自动抓取已关闭（CATALYST_FETCH=0）")
+    day = day if (day and re.fullmatch(r"\d{8}", day)) else ((get("observe").get("data") or {}).get("day") or last_close_day())
+    r = CAT.ensure(day, [(code, None)], wait_s=max(0.0, min(float(wait), 20.0)))[code]
+    return {"day": day, **{k: v for k, v in r.items() if not k.startswith("_")}}
 @app.get("/api/watch")
 def api_watch():
     s = get("spot"); rows = (s.get("data") or {}).get("rows", {}); wl = read_watch()
@@ -1146,6 +1183,24 @@ def api_pool():
             return (pri, {"yes": 0, "watch": 1, "hold": 2, "no": 3, "na": 4}.get(r.get("conclusion_cls"), 9))
         rows.sort(key=rank)
         focus = rows
+    cat_day = (obs or {}).get("day") or last_close_day()
+    oc_view = oc
+    if CAT_ENABLED:
+        def ann(rows_, limit):
+            out_rows = []
+            need = []
+            for i, r in enumerate(rows_ or []):
+                r = dict(r)
+                if i < limit and r.get("code"):
+                    c = CAT.peek(cat_day, r["code"])
+                    if c: r["catalyst"] = PS._cat_view(c)
+                    else: need.append((r["code"], r.get("name")))
+                out_rows.append(r)
+            # 后台补抓，不阻塞；队列繁忙时让位给观察池候选
+            if need and CAT.status().get("inflight", 0) < 6: CAT.ensure(cat_day, need[:10], wait_s=0)
+            return out_rows
+        focus = ann(focus, 30)
+        if oc and oc.get("rows"): oc_view = {**oc, "rows": ann(oc["rows"], 25)}
     return {
         "now": nows(), "phase": phase(), "phase_cn": PHASE_CN[phase()], "ref_day": ref_day(),
         "last_close_day": last_close_day(),
@@ -1157,9 +1212,10 @@ def api_pool():
         "observe": {**meta("observe"), "data": obs},
         "w2s_candidates": (obs or {}).get("w2s_candidates") if obs else None,
         "auction_focus": focus, "auction": meta("auction"),
-        "open_confirm": {**meta("open_confirm"), "data": oc},
+        "open_confirm": {**meta("open_confirm"), "data": oc_view},
         "trade_pool": {**meta("trade_pool"), "data": tp},
-        "disclaimer": "公开网页行情，非 Level-2；催化/解禁/监管默认未核验；仅供研究参考，不构成投资建议",
+        "catalyst": {"enabled": CAT_ENABLED, "day": cat_day, **(CAT.status() if CAT_ENABLED else {})},
+        "disclaimer": "公开网页行情，非 Level-2；催化/解禁/监管为公告/资讯标题关键词自动判断，抓取失败即未核验；仅供研究参考，不构成投资建议",
     }
 
 @app.post("/api/pool/note")

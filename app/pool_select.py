@@ -119,6 +119,10 @@ def _辨识度(rows_in_ind: list[dict], r: dict) -> tuple[bool, list[str]]:
         ok = True; reasons.append(f"板块内封单最强 {r.get('seal_yi')} 亿")
     return ok, reasons
 
+def _cat_view(cat: dict | None) -> dict | None:
+    if not cat: return None
+    return {k: cat.get(k) for k in ("flag", "flag_kind", "reason", "status", "top", "counts", "fetched_at", "ann_source", "window")}
+
 def planned_buy_point(stage_mode: str, r: dict, is_leader: bool, is_mid: bool) -> str:
     lb = r.get("lb") or 1
     lan = is_lanban_or_tail(r)
@@ -142,9 +146,12 @@ def planned_buy_point(stage_mode: str, r: dict, is_leader: bool, is_mid: bool) -
 def build_observe_pool(zt_rows: list[dict], *, stage_mode: str, tier: str | None,
                        sectors: dict | None, float_caps: dict[str, float | None],
                        watchlist: list[dict], user_notes: dict | None = None,
-                       pool_day: str, position: dict | None = None) -> dict:
-    """盘前观察池。float_caps: code -> 流通市值亿元 or None。"""
+                       pool_day: str, position: dict | None = None,
+                       catalysts: dict[str, dict] | None = None) -> dict:
+    """盘前观察池。float_caps: code -> 流通市值亿元 or None。
+    catalysts: code -> catalyst.summarize() 结果；None 表示未启用自动抓取（一律「未核验」）。"""
     user_notes = user_notes or {}
+    cat_excluded: list[tuple[str, str]] = []
     main = identify_mainlines(zt_rows, sectors, stage_mode)
     theme_inds = {m["industry"] for m in main["mainlines"] if m.get("kind") != "退潮方向（慎做）"}
     weak_inds = {m["industry"] for m in main["mainlines"] if m.get("is_weak_board")}
@@ -218,11 +225,28 @@ def build_observe_pool(zt_rows: list[dict], *, stage_mode: str, tier: str | None
         else:
             flags["cap_ok"] = False; reasons.append(f"流通市值 {cap} 亿，超出约 {CAP_MIN_YI}-{CAP_MAX_YI} 亿区间（软条件，仍可观察）")
 
-        # 催化始终未核验（除非用户标注）
+        # 催化/解禁/监管：用户标注优先；其次自动抓取结果；未抓取则「未核验」
+        cat = (catalysts or {}).get(code) if catalysts is not None else None
+        cat_view = _cat_view(cat)
         if note.get("catalytic_verified"):
-            flags["catalytic"] = "已核验（用户）"; reasons.append("催化/解禁/监管：用户已核验")
+            flags["catalytic"] = "已核验（用户）"; flags["catalytic_kind"] = "user"
+            extra = f"（自动结果：{cat['flag']}，以用户核验为准）" if cat and cat.get("flag_kind") != "pass" else ""
+            reasons.append("催化/解禁/监管：用户已核验" + extra)
+        elif cat and cat.get("flag_kind") == "exclude":
+            cat_excluded.append((code, name))
+            rejected.append({"code": code, "name": name, "industry": ind, "amount_yi": amt,
+                             "reasons": [f"公告/资讯负面：{cat.get('flag')}", cat.get("reason") or ""],
+                             "conclusion_for_observe": "剔除", "catalyst": cat_view})
+            continue
+        elif cat:
+            flags["catalytic"] = cat.get("flag") or "未核验"; flags["catalytic_kind"] = cat.get("flag_kind") or "unverified"
+            reasons.append(f"催化/解禁/监管：{flags['catalytic']}")
+        elif catalysts is not None:
+            flags["catalytic"] = "未核验（尚未抓取）"; flags["catalytic_kind"] = "unverified"
+            reasons.append("催化/解禁/监管：未核验（尚未抓取）")
         else:
-            flags["catalytic"] = "未核验"; reasons.append("催化/解禁/监管：未核验")
+            flags["catalytic"] = "未核验"; flags["catalytic_kind"] = "unverified"
+            reasons.append("催化/解禁/监管：未核验")
 
         bp = planned_buy_point(stage_mode, r, is_id, is_mid)
         lan = is_lanban_or_tail(r)
@@ -246,6 +270,7 @@ def build_observe_pool(zt_rows: list[dict], *, stage_mode: str, tier: str | None
             "conclusion_for_observe": conc,
             "amount": r.get("amount"),
             "pinned": bool(note.get("pin")),
+            "catalyst": cat_view,
             "rank_key": (
                 0 if note.get("pin") else 1,
                 0 if theme_label in ("主线", "新方向") and is_id else (1 if "候选" in theme_label and (r.get("lb") or 1) == 1 else 2),
@@ -263,6 +288,7 @@ def build_observe_pool(zt_rows: list[dict], *, stage_mode: str, tier: str | None
                         "note": "供 09:26 竞价验证弱转强"})
 
     observe.sort(key=lambda x: x["rank_key"])
+    candidates_ranked = [(r["code"], r["name"]) for r in observe] + cat_excluded
     # cap 10 for 入观察池+仅参考 ranked; keep conclusion
     top = observe[:OBSERVE_CAP]
     overflow = observe[OBSERVE_CAP:]
@@ -295,11 +321,15 @@ def build_observe_pool(zt_rows: list[dict], *, stage_mode: str, tier: str | None
         "industry_zt_counts": main["industry_zt_counts"],
         "observe": top, "w2s_candidates": w2s, "rejected": rejected,
         "watchlist": wl_out, "observe_cap": OBSERVE_CAP,
+        "candidates_ranked": candidates_ranked,
         "rules": {
             "mainline": f"行业涨停≥{MIN_ZT_MAINLINE}为完整主线；不足时≥{MIN_ZT_CANDIDATE}为候选",
             "liquidity": f"成交额≥{MIN_AMOUNT_YI}亿（硬条件）",
             "cap": f"流通市值约{CAP_MIN_YI}-{CAP_MAX_YI}亿（软条件）",
-            "catalytic": "催化/解禁/监管默认未核验，不自动通过",
+            "catalytic": ("公告/资讯自动抓取（近约10个交易日）：负面（监管问询/立案、ST/退市风险、业绩预亏、股东减持）剔除；"
+                          "风险项（解禁、风险提示、澄清、诉讼冻结、重大事项终止）保持未核验；正面（政策/业绩增长/订单合同/产业事件/增持回购）"
+                          "标「已核验（自动）」；抓取失败为未核验并注明原因；用户「催化已核验」优先"
+                          if catalysts is not None else "催化/解禁/监管默认未核验，不自动通过"),
             "retreat": "退潮期观察池偏向新方向首板；暂停分歧转一致/趋势中军回踩建仓",
         },
     }
@@ -391,7 +421,8 @@ def merge_trade_pool(day: str, observe: dict | None, auction: dict | None,
     return {"day": day, "observe": [{"code": r["code"], "name": r.get("name"),
                                      "conclusion": r.get("conclusion_for_observe"),
                                      "planned_buy_point": r.get("planned_buy_point"),
-                                     "theme": r.get("theme"), "industry": r.get("industry")} for r in obs_rows],
+                                     "theme": r.get("theme"), "industry": r.get("industry"),
+                                     "catalytic": (r.get("pass_flags") or {}).get("catalytic")} for r in obs_rows],
             "focus": focus2, "confirmed": confirmed,
             "rejected": [{"code": r.get("code"), "name": r.get("name"), "reasons": r.get("reasons")} for r in rejected[:50]],
             "notes": notes, "updated_at": None}
