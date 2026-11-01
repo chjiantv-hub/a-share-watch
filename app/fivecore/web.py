@@ -99,6 +99,12 @@ def create_router(ctx: dict) -> APIRouter:
             return {'available': False, 'feed': feed,
                     'message': '尚未取到行情（后台首次拉取中或数据源失败）。当前没有真实行情，不输出交易结论。'}
         res = analyze_market(raw)
+        sel = None
+        try:
+            if ctx.get('selection'):
+                sel = ctx['selection']()
+        except Exception:
+            sel = None
         res.update({
             'available': True, 'feed': feed, 'source': raw.get('source'),
             'trade_date': raw.get('trade_date'), 'data_time': raw.get('data_time') or {},
@@ -108,6 +114,7 @@ def create_router(ctx: dict) -> APIRouter:
             'missing_fields': raw.get('missing_fields') or [k for k in ('advancers', 'decliners', 'unchanged', 'limit_up', 'limit_down',
                               'broken_limit', 'yesterday_limit_premium_pct', 'turnover_yi', 'turnover_vs_prev_pct') if raw.get(k) is None],
             'reference': raw.get('reference'),
+            'selection': sel,
             'banner': BANNER_PUBLIC if feed == PUBLIC_QUALITY else (None if feed == 'licensed' else '数据源未核验，仅供研究参考'),
         })
         return res
@@ -213,11 +220,21 @@ def create_router(ctx: dict) -> APIRouter:
                 hint['note'] = f"该结论为 {au.get('day')} 复盘数据，非今日实时竞价，仅作参考，不计分。"
             elif s.get('entry_trigger') is not None:
                 hint['note'] = '已采用用户填写的买点判断。'
+        pool_ctx = None
+        try:
+            if ctx.get('pool_context'):
+                pool_ctx = ctx['pool_context'](code)
+        except Exception:
+            pool_ctx = None
+        # 若在观察池/确认池，可提示主线字段（不自动当证据满分）
+        if pool_ctx and s.get('is_mainline') is None and pool_ctx.get('theme'):
+            # 仅附加上下文，不改 is_mainline 计分（催化未核验）
+            pass
         res = analyze_stock(s, m)
         res.update({'quote_time': q.get('time'), 'board': ctx['board_of'](code, q.get('name'))[0], 'autofill': autofill,
-                    'judgment_source': provided, 'system_hint': hint,
+                    'judgment_source': provided, 'system_hint': hint, 'pool_context': pool_ctx,
                     'ignored_user_values': ignored or None,
-                    'market': {k: m.get(k) for k in ('environment', 'sentiment', 'feed', 'data_quality', 'data_quality_cn', 'timestamp', 'trade_date', 'banner')}})
+                    'market': {k: m.get(k) for k in ('environment', 'sentiment', 'feed', 'data_quality', 'data_quality_cn', 'timestamp', 'trade_date', 'banner', 'selection')}})
         return res
 
     return r

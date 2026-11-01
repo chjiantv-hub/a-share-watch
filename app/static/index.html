@@ -63,6 +63,10 @@ input,select{background:var(--card2);color:var(--tx);border:1px solid var(--line
 .lad .b{flex:none;width:52px;font-weight:900;font-size:18px;color:var(--up)}
 .lad .s{display:flex;flex-wrap:wrap;gap:5px}
 .chip{background:var(--card2);border-radius:8px;padding:4px 8px;font-size:12px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.chip.on{background:#1a3a2a;color:#5fe29a;border:1px solid #2a5a40}
+.chip.warn{background:#2a2210;color:#f5c451}
+.btn.mini{padding:6px 10px;font-size:12px;min-height:32px;width:auto;display:inline-block}
 .seg{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
 .seg button{background:var(--card2);border:1px solid var(--line);color:var(--tx);border-radius:18px;padding:8px 12px;font-size:13px;font-weight:600;min-height:36px}
 .seg button.on{background:var(--acc);border-color:var(--acc);color:#fff}
@@ -110,7 +114,7 @@ details summary::-webkit-details-marker{display:none}
 <footer>仅供参考，不构成投资建议 · 非 Level-2 行情</footer>
 <nav id="nav"></nav>
 <script>
-const TABS=[["watch","自","自选"],["alerts","铃","提醒"],["limit","板","涨停"],["auction","竞","竞价"],["sent","情","情绪"]];
+const TABS=[["watch","自","自选"],["alerts","铃","提醒"],["limit","板","涨停"],["pool","选","选股"],["auction","竞","竞价"],["sent","情","情绪"]];
 const u=new URL(location.href); let TK=u.searchParams.get('t'); if(TK) localStorage.setItem('asw_t',TK); else TK=localStorage.getItem('asw_t')||'';
 document.getElementById('mf').href='/manifest.webmanifest?t='+encodeURIComponent(TK);
 let TAB=(location.hash||'#watch').slice(1); if(!TABS.find(t=>t[0]==TAB)) TAB='watch';
@@ -132,7 +136,7 @@ function go(t){TAB=t;location.hash=t;nav();render(true);window.scrollTo(0,0)}
 let busy=false, stickyCache='';
 function setSticky(html){ stickyCache=html||''; const el=$('#sticky'); if(html){el.style.display='block';el.innerHTML=html} else {el.style.display='none';el.innerHTML=''} }
 async function render(force){ if(busy&&!force) return; busy=true;
-  try{ await ({watch:rWatch,alerts:rAlerts,limit:rLimit,auction:rAuction,sent:rSent})[TAB](); }
+  try{ await ({watch:rWatch,alerts:rAlerts,limit:rLimit,pool:rPool,auction:rAuction,sent:rSent})[TAB](); }
   catch(e){ setSticky(''); $('#main').innerHTML=`<div class="card"><div class="empty">加载失败：${esc(e.message)}</div></div>`; }
   busy=false;}
 
@@ -464,6 +468,140 @@ function paintChart(code, kind, data){
     if(info) info.innerHTML=`${last?last.d:''} · <span class="${last&&prev&&last.c>=prev.c?'up':'dn'}">${last?last.c.toFixed(2):'—'}${pctStr}</span> · ${data.bars.length}日`;
   }
   if(!ok && msg){ msg.style.display='flex'; msg.textContent='绘制失败'; }
+}
+
+
+/* ---------- 选股入池 ---------- */
+let PSEG='pre';
+const PCONC={入观察池:'yes',仅参考:'hold',剔除:'no',可建仓:'yes',只看不追:'watch','暂不可建仓，继续观察':'hold',继续观察:'hold',暂不可建仓:'hold',不可建仓:'no',未取到:'na'};
+function fcLink(code){
+  return `<a class="btn mini sec" href="/fivecore/?t=${encodeURIComponent(TK)}#analyze=${code}" onclick="event.stopPropagation()">五核</a>`;
+}
+async function poolNote(code, action){
+  try{ await api('/api/pool/note',{method:'POST',body:JSON.stringify({code,action})}); toast(action+' · '+code); render(true);}catch(e){toast(e.message)}
+}
+async function rPool(){
+  const d=await api('/api/pool');
+  const s=d.sent||{}, obs=(d.observe&&d.observe.data)||null, oc=(d.open_confirm&&d.open_confirm.data)||null, tp=(d.trade_pool&&d.trade_pool.data)||null;
+  const mains=(obs&&obs.mainlines)||[];
+  setSticky(`<div class="line">${esc(s.one_line||((s.tier||'—')+' · '+(s.stage_mode||'—')))}</div>
+    <div class="sub">${esc(d.phase_cn)} · 池日 ${(obs&&obs.day)||d.last_close_day||'—'} · 观察 ${(obs&&obs.observe)?obs.observe.length:0} 只</div>`);
+  let h=`<div class="pull">↓ 下拉刷新</div>`;
+  if(s.must_empty) h+=`<div class="banner">必须空仓：今日不做新建仓</div>`;
+  h+=`<div class="one"><div class="t">${esc(s.tier||'—')} · ${esc(s.stage_mode||'—')} · 仓位 ${esc((s.position&&s.position.total)||'—')}</div>
+    <div class="p">主线：${mains.length?mains.map(m=>esc(m.industry)+'('+m.zt_n+')'+(m.kind&&m.kind!=='主线'?'·'+esc(m.kind):'')).join('、'):'未识别'}
+    ${(obs&&obs.mainline_note)?'<br>'+esc(obs.mainline_note):''}
+    ${(obs&&obs.sector_inflow_note)?'<br>'+esc(obs.sector_inflow_note):''}</div></div>`;
+  h+=`<div class="card"><div class="seg">${[['pre','盘前'],['auc','竞价'],['cfm','确认'],['in','入池']].map(t=>`<button class="${PSEG==t[0]?'on':''}" onclick="PSEG='${t[0]}';render(true)">${t[1]}</button>`).join('')}</div>`;
+
+  if(PSEG==='pre'){
+    if(!obs){ h+=`<div class="empty">观察池尚未生成（后台拉取中）</div>${meta(d.observe)}</div>`; $('#main').innerHTML=h; return; }
+    if(obs.replay) h+=`<div class="note">当前为休市/盘后回放，池日 <b>${esc(obs.day)}</b>。交易日 07:00 盘前会按上一交易日复盘重建。</div>`;
+    h+=`<div class="chips">`+(mains.map(m=>`<span class="chip ${m.kind&&m.kind.indexOf('退潮')>=0?'warn':(m.mainline_ok===true?'on':'')}">${esc(m.kind||'主线')} · ${esc(m.industry)} · 涨停${m.zt_n}${m.main_net_yi_today!=null?' · 流入'+m.main_net_yi_today+'亿':''}</span>`).join('')||`<span class="chip">主线未识别</span>`)+`</div>`;
+    h+=`<h2 style="font-size:15px;margin:10px 0 6px">盘前观察池 <span class="mut" style="font-size:12px">最多 ${obs.observe_cap||10} 只</span></h2>`;
+    if(!(obs.observe||[]).length) h+=`<div class="empty">无入池标的（硬性条件未满足或主线未识别）</div>`;
+    for(const r of (obs.observe||[])){
+      const cc=PCONC[r.conclusion_for_observe]||'hold';
+      h+=`<div class="acard ${cc}"><div class="hd"><div><div class="name">${esc(r.name)} <span class="c">${r.code}</span></div>
+        <div class="c">${esc(r.theme||'')} · ${esc(r.industry||'')} · ${r.lb||'—'}板 · 额 ${r.amount_yi??'—'}亿</div>
+        <div style="margin-top:4px"><span class="tag t-${cc}">${esc(r.conclusion_for_observe)}</span>
+        ${r.planned_buy_point&&r.planned_buy_point!=='—'?'<span class="tag">'+esc(r.planned_buy_point)+'</span>':''}
+        ${(r.pass_flags&&r.pass_flags.catalytic)?`<span class="tag t-hold">${esc(r.pass_flags.catalytic)}</span>`:''}
+        ${r.lanban?'<span class="tag t-watch">烂板/尾盘</span>':''}</div></div>
+        <div>${fcLink(r.code)}</div></div>
+        <div class="c" style="margin-top:6px">关注价：昨收 ${(r.watch_prices&&r.watch_prices['昨收'])??'未取到'} · 昨低 ${(r.watch_prices&&r.watch_prices['昨低'])??'未取到'}
+        · 市值 ${(r.pass_flags&&r.pass_flags.float_cap_yi)!=null?r.pass_flags.float_cap_yi+'亿':(r.pass_flags&&r.pass_flags.cap_ok==='unknown'?'未知':'—')}</div>
+        <div class="reason">${(r.reasons||[]).map(esc).join('；')}</div>
+        <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
+          <button class="btn mini sec" onclick="poolNote('${r.code}','催化已核验')">催化已核验</button>
+          <button class="btn mini sec" onclick="poolNote('${r.code}','置顶')">置顶</button>
+          <button class="btn mini sec" onclick="poolNote('${r.code}','剔除')">剔除</button>
+        </div></div>`;
+    }
+    h+=`<h2 style="font-size:15px;margin:14px 0 6px">弱转强候选（供 09:26）</h2>`;
+    const w2s=obs.w2s_candidates||[];
+    if(!w2s.length) h+=`<div class="empty">无（需主线/新方向下昨日首板烂板或尾盘板）</div>`;
+    else h+=w2s.map(r=>`<div class="acard hold"><div class="hd"><div><div class="name">${esc(r.name)} <span class="c">${r.code}</span></div>
+      <div class="c">${esc(r.theme)} · ${esc(r.industry)} · 额 ${r.amount_yi??'—'}亿 · 炸 ${r.zb_times??0}</div>
+      <div class="reason">${esc(r.note||'')}</div></div>${fcLink(r.code)}</div></div>`).join('');
+    h+=`<h2 style="font-size:15px;margin:14px 0 6px">自选（独立跟踪）</h2>`;
+    const wl=obs.watchlist||[];
+    if(!wl.length) h+=`<div class="empty">暂无自选</div>`;
+    else h+=wl.map(w=>`<div class="stock"><div><span class="nm">${esc(w.name)}</span> <span class="sub">${w.code}</span>
+      ${w.in_observe?'<span class="tag t-w2s">在观察池</span>':'<span class="tag t-hold">未入观察池</span>'}
+      ${w.planned_buy_point&&w.planned_buy_point!=='—'?'<span class="tag">'+esc(w.planned_buy_point)+'</span>':''}
+      <div class="sub">${esc(w.observe_conclusion||'—')} · ${esc(w.board||'')}</div></div>${fcLink(w.code)}</div>`).join('');
+    const rej=obs.rejected||[];
+    h+=`<details style="margin-top:12px"><summary>已剔除 / 未入选（${rej.length}）</summary>`;
+    h+=rej.slice(0,40).map(r=>`<div class="ev"><div class="t">${esc(r.code)}</div><div><b>${esc(r.name||'')}</b> · ${esc(r.industry||'')}<div class="c">${esc((r.reasons||[]).join('；'))}</div></div></div>`).join('')||`<div class="empty">无</div>`;
+    h+=`</details>`;
+    h+=`<div class="meta">规则：主线行业涨停≥5（不足则≥3为候选）；成交额≥5亿硬条件；流通市值约50-500亿软条件；催化默认未核验。退潮期只偏向新方向首板弱转强。</div>${meta(d.observe)}</div>`;
+  }
+
+  if(PSEG==='auc'){
+    const rows=d.auction_focus||[];
+    h+=`<div class="note">以下优先展示观察池与自选在竞价筛选中的结果；完整列表见底部「竞」页。</div>`;
+    h+=`<div class="meta">${meta(d.auction)}</div>`;
+    const prefer=rows.filter(r=> (r.src||[]).includes('观察池') || r.is_watchlist || (r.src||[]).includes('自选') || (r.src||[]).includes('弱转强候选'));
+    const show=prefer.length?prefer:rows.slice(0,20);
+    if(!show.length) h+=`<div class="empty">竞价结果尚未生成</div></div>`;
+    else{
+      h+=show.slice(0,30).map(r=>{
+        const cc=r.conclusion_cls||PCONC[r.conclusion]||'na';
+        return `<div class="acard ${cc}"><div class="hd"><div><div class="name">${esc(r.name)} <span class="c">${r.code}</span></div>
+          <div class="c">${esc((r.src||[]).join(' · '))}</div>
+          <div style="margin-top:4px"><span class="tag t-${r.cls||'none'}">${esc(r.tag||'—')}</span>
+          <span class="tag t-${cc}">${esc(r.conclusion||'未取到')}</span>
+          ${r.buy_point&&r.buy_point!=='—'?'<span class="tag">'+esc(r.buy_point)+'</span>':''}</div></div>
+          <div class="pct ${cls(r.pct)}">${r.pct==null?'—':((r.pct>0?'+':'')+Number(r.pct).toFixed(2)+'%')}</div></div>
+          <div class="reason">${esc(r.reason||'')}</div>
+          <div style="margin-top:6px">${fcLink(r.code)}</div></div>`;
+      }).join('');
+      h+=`<button class="btn sec more" onclick="go('auction')">打开完整竞价页</button></div>`;
+    }
+  }
+
+  if(PSEG==='cfm'){
+    if(!oc){ h+=`<div class="empty">开盘确认尚未生成</div>${meta(d.open_confirm)}</div>`; }
+    else{
+      if(oc.pending) h+=`<div class="note">${esc(oc.note||'09:40 后生成开盘确认')}</div>`;
+      if(oc.replay) h+=`<div class="note">回放：${esc(oc.day)} 日 09:30-09:40 分时口径。</div>`;
+      const sm=oc.summary||{};
+      h+=`<div class="grid g3"><div class="kv"><div class="k">重点</div><div class="v">${sm.n??NA}</div></div>
+        <div class="kv"><div class="k">可建仓</div><div class="v up">${sm.can_buy??NA}</div></div>
+        <div class="kv"><div class="k">不可</div><div class="v dn">${sm.no??NA}</div></div></div>`;
+      h+=(oc.rows||[]).map(r=>{
+        const cc=r.conclusion_cls||PCONC[r.conclusion]||'na';
+        const m=r.metrics||{};
+        return `<div class="acard ${cc}"><div class="hd"><div><div class="name">${esc(r.name)} <span class="c">${r.code}</span></div>
+          <div class="c">${esc(r.from||'')} · ${esc(r.buy_point||'—')}</div>
+          <div style="margin-top:4px"><span class="tag t-${cc}">${esc(r.conclusion||'未取到')}</span></div></div></div>
+          <div class="c" style="margin-top:6px">开${m.open??'—'} · 09:40 ${m.last_0940??'—'} · 高${m.high??'—'} · 量较昨 ${m.vol_vs_yest??'未取到'}</div>
+          <div class="reason">${esc(r.reason||'')}</div>
+          <div style="margin-top:6px">${fcLink(r.code)}</div></div>`;
+      }).join('')||`<div class="empty">无重点股</div>`;
+      h+=`${meta(d.open_confirm)}</div>`;
+    }
+  }
+
+  if(PSEG==='in'){
+    const conf=(tp&&tp.confirmed)||[];
+    const focus=(tp&&tp.focus)||[];
+    h+=`<div class="note">今日交易池来自开盘确认「可建仓」+ 竞价重点。Render 免费盘重启后会按公开数据重建；用户标注保存在 trade_pool.json。</div>`;
+    h+=`<h2 style="font-size:15px;margin:8px 0 6px">确认可建仓（${conf.length}）</h2>`;
+    if(!conf.length) h+=`<div class="empty">暂无（需 09:40 确认通过）</div>`;
+    else h+=conf.map(r=>`<div class="acard yes"><div class="hd"><div><div class="name">${esc(r.name)} <span class="c">${r.code}</span></div>
+      <div class="c">${esc(r.buy_point||'—')}</div><div class="reason">${esc(r.reason||'')}</div></div>${fcLink(r.code)}</div></div>`).join('');
+    h+=`<h2 style="font-size:15px;margin:14px 0 6px">竞价重点（${focus.length}）</h2>`;
+    if(!focus.length) h+=`<div class="empty">暂无</div>`;
+    else h+=focus.map(r=>`<div class="acard hold"><div class="name">${esc(r.name)} <span class="c">${r.code}</span>
+      <span class="tag">${esc(r.conclusion||'—')}</span> ${esc(r.buy_point||'')}</div>
+      <div class="c">${esc((r.src||[]).join(' · '))}</div></div>`).join('');
+    h+=`<div class="meta">可在观察池卡片点「五核」调用五核智选分析；分析会附带 pool_context。</div>${meta(d.trade_pool)}</div>`;
+  }
+
+  h+=`<div class="meta">${esc(d.disclaimer||'')}</div>`;
+  $('#main').innerHTML=h;
 }
 
 /* ---------- notifications + pull refresh ---------- */

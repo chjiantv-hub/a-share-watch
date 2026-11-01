@@ -12,6 +12,7 @@ sys.path.insert(0, POOL_DIR); sys.path.insert(0, APP_DIR) if APP_DIR != POOL_DIR
 _argv = sys.argv; sys.argv = [sys.argv[0]]          # quotes.py parses argv at import
 import quotes as Q                                   # noqa: E402
 import pools as P                                    # noqa: E402
+import pool_select as PS                             # noqa: E402
 sys.argv = _argv
 import requests                                      # noqa: E402
 from fastapi import FastAPI, Request, HTTPException  # noqa: E402
@@ -24,6 +25,7 @@ SEED_DIR = os.environ.get("SEED_DIR", os.path.join(os.path.dirname(APP_DIR), "se
 if not os.path.exists(WATCH_MD) and os.path.exists(os.path.join(SEED_DIR, "watchlist.md")):   # first boot / ephemeral disk
     import shutil; shutil.copy(os.path.join(SEED_DIR, "watchlist.md"), WATCH_MD)
 RULES_F = os.path.join(DATA, "rules.json"); EVENTS_F = os.path.join(DATA, "alert_log.json")
+TRADE_POOL_F = os.path.join(DATA, "trade_pool.json")
 TOKEN_F = os.path.join(DATA, "token.txt")
 BJ = Q.BJ
 LOCK = threading.RLock()
@@ -71,6 +73,11 @@ def ref_day():
     """Trading day whose data is 'current': today if trading day and >=09:15, else last trading day."""
     n = now(); d = n.strftime("%Y%m%d")
     if is_trade_day(d) and n.hour * 100 + n.minute >= 915: return d
+    return prev_trade_day(d)
+def last_close_day():
+    """最近一个已收盘交易日（盘前/休市复盘用）。"""
+    n = now(); d = n.strftime("%Y%m%d")
+    if is_trade_day(d) and n.hour * 100 + n.minute >= 1500: return d
     return prev_trade_day(d)
 def phase():
     n = now(); hm = n.hour * 100 + n.minute
@@ -358,17 +365,33 @@ def job_minutes():
 
 # ---- auction ----
 def auction_candidates():
+    """优先：观察池 → 自选 → 昨日涨停/炸板池。实现「从观察池中选」的 09:26 筛选。"""
     pp = get("prevpools").get("data") or {}
+    obs = (get("observe").get("data") or {})
     cand = {}
-    for c in watch_codes(): cand[c] = {"code": c, "src": ["自选"], "prev_amount": None}
+    def add(code, src_tag, **kw):
+        e = cand.setdefault(code, {"code": code, "src": [], "prev_amount": None})
+        if src_tag and src_tag not in e["src"]: e["src"].append(src_tag)
+        for k, v in kw.items():
+            if v is not None and e.get(k) in (None, "", []): e[k] = v
+        return e
+    for r in obs.get("observe") or []:
+        amt = r.get("amount")
+        if amt is None and r.get("amount_yi") is not None:
+            try: amt = float(r["amount_yi"]) * 1e8
+            except Exception: amt = None
+        add(r["code"], "观察池", name=r.get("name"), industry=r.get("industry"), prev_amount=amt,
+            planned_buy_point=r.get("planned_buy_point"))
+    for r in obs.get("w2s_candidates") or []:
+        add(r["code"], "弱转强候选", name=r.get("name"), industry=r.get("industry"))
+    for c in watch_codes():
+        add(c, "自选")
     for r in pp.get("zt", []):
         lan = r["zb_times"] > 0 or r["last_seal"] >= "140000"
         tag = f"昨日{r['lb']}板" + ("·烂板/尾盘板" if lan else "")
-        e = cand.setdefault(r["code"], {"code": r["code"], "src": [], "prev_amount": None}); e["src"].append(tag)
-        e["prev_amount"] = r["amount"]; e["name"] = r["name"]; e["industry"] = r["industry"]
+        add(r["code"], tag, name=r.get("name"), industry=r.get("industry"), prev_amount=r.get("amount"))
     for r in pp.get("zb", []):
-        e = cand.setdefault(r["code"], {"code": r["code"], "src": [], "prev_amount": None}); e["src"].append(f"昨日炸板{r['zb_times']}次")
-        e["prev_amount"] = r["amount"]; e["name"] = r["name"]; e["industry"] = r["industry"]
+        add(r["code"], f"昨日炸板{r['zb_times']}次", name=r.get("name"), industry=r.get("industry"), prev_amount=r.get("amount"))
     return pp, cand
 def tag_auction(pct, ratio, is_yz, code, name):
     if pct is None: return "未取到", "na"
@@ -449,8 +472,9 @@ def job_auction():
         put("auction", {**cur, "note": "09:25 前无撮合结果；09:25 后自动刷新"}, source=get("auction").get("source")); return
     else:
         cur = get("auction").get("data") or {}
-        # 旧缓存无 conclusion 字段时强制重算（规则升级）
-        if cur.get("day") == rd and cur.get("mode") == "first_bar" and cur.get("complete") and cur.get("rows") and cur["rows"][0].get("conclusion"): return
+        # 旧缓存无 conclusion 字段时强制重算；观察池更新后需带「观察池」标签重算
+        if (cur.get("day") == rd and cur.get("mode") == "first_bar" and cur.get("complete")
+                and cur.get("rows") and cur["rows"][0].get("conclusion") and not cur.get("stale_for_observe")): return
         mode = "first_bar"
         def one(c):
             e = cand[c]
@@ -519,7 +543,7 @@ def job_auction():
                     "must_empty": sent.get("must_empty"), "position": sent.get("position"),
                     "buy_points_active": sent.get("buy_points_active"), "buy_points_paused": sent.get("buy_points_paused")},
         source=("腾讯快照 qt.gtimg.cn（9:25-9:30 竞价撮合价/额）" if mode == "live" else "腾讯分时首根 09:30 bar（=开盘集合竞价撮合）")
-               + f"；候选=自选+{pp.get('date')}涨停/炸板池（{pp.get('src_zt') or '东方财富'}）")
+               + f"；候选=观察池优先+自选+{pp.get('date')}涨停/炸板池（{pp.get('src_zt') or '东方财富'}）")
 
 # ---------------- sentiment ----------------
 def sentiment():
@@ -723,19 +747,231 @@ def fetch_day_chart(code, n=60):
     return {"code": code, "kind": "day", "bars": bars, "adjust": "qfq", "n": n,
             "source": f"腾讯 {src}（前复权）", "error": None if bars else "日K为空"}
 
+
+# ---------------- 选股入池：板块 / 观察池 / 开盘确认 / 交易池 ----------------
+def _float_caps(codes):
+    """东方财富 f21 流通市值（亿元）。失败则返回 {}，调用方标 unknown。"""
+    out = {}
+    codes = [c for c in codes if c]
+    for i in range(0, len(codes), 40):
+        chunk = codes[i:i + 40]
+        try:
+            j = Q.em_get("/api/qt/ulist.np/get", {"fltt": 2, "invt": 2,
+                "secids": ",".join(Q.secid(c) for c in chunk), "fields": "f12,f14,f20,f21"}, timeout=10)
+            for d in ((j.get("data") or {}).get("diff") or []):
+                v = d.get("f21")
+                try: out[str(d["f12"])] = round(float(v) / 1e8, 1) if v not in (None, "-", "") else None
+                except Exception: out[str(d["f12"])] = None
+        except Exception as e:
+            log("float_caps fail", e)
+        if i + 40 < len(codes): time.sleep(0.35)
+    return out
+
+def job_sectors():
+    n = 15
+    raw = Q.cmd_sectors(n)
+    # normalize errors to honest strings
+    def clean(v):
+        if isinstance(v, list):
+            return [{"board": x.get("board"), "code": x.get("code"), "pct": x.get("pct"),
+                     "main_net_yi": x.get("main_net_yi"), "up_down": x.get("up/down") or x.get("up_down"),
+                     "leader": x.get("leader")} for x in v]
+        return f"未取到：{v}" if v is not None else "未取到"
+    data = {"n": n, "fetched_at": raw.get("fetched_at"), "data_time": raw.get("data_time"),
+            "industry_top": clean(raw.get("industry_top")), "industry_bottom": clean(raw.get("industry_bottom")),
+            "industry_inflow_top": clean(raw.get("industry_inflow_top")),
+            "concept_top": clean(raw.get("concept_top")), "concept_bottom": clean(raw.get("concept_bottom")),
+            "concept_inflow_top": clean(raw.get("concept_inflow_top")),
+            "note": "板块主力净流入为当日快照；本服务未缓存历史，不能宣称连续2天流入"}
+    put("sectors", data, source=f"东方财富板块榜（镜像）·{raw.get('source') or 'eastmoney boards'}；数据时间 {raw.get('data_time') or '—'}")
+
+def _zt_for_observe(day):
+    lu = get("limitup").get("data") or {}
+    if lu.get("date") == day and lu.get("zt") is not None:
+        return lu["zt"], f"涨停池 {day}（limitup缓存·{(lu.get('sources') or {}).get('zt') or '—'}）"
+    pp = get("prevpools").get("data") or {}
+    if pp.get("date") == day and pp.get("zt") is not None:
+        return pp["zt"], f"涨停池 {day}（prevpools·{pp.get('src_zt') or '—'}）"
+    rows, src, _ = P.get_pool("zt", day)
+    return rows, f"涨停池 {day}（即时拉取·{src}）"
+
+def _persist_trade_pool(tp):
+    tp = dict(tp); tp["updated_at"] = nows()
+    try: jsave(TRADE_POOL_F, tp)
+    except Exception as e: log("trade_pool save fail", e)
+    put("trade_pool", tp, source="内存+DATA_DIR/trade_pool.json（Render 免费盘重启会丢，启动后按公开数据重建）")
+
+def job_observe():
+    day = last_close_day()
+    zt, src = _zt_for_observe(day)
+    if zt is None: raise RuntimeError(f"观察池依赖的涨停池未取到（{day}）")
+    sent = sentiment()
+    stage = sent.get("stage_mode") or "过渡期模式"
+    sectors = get("sectors").get("data")
+    caps = _float_caps([r["code"] for r in zt])
+    # 昨收/昨低：尽量用腾讯日K最后一根（可选，失败则空）
+    watch_px = {}
+    try:
+        sample = [r["code"] for r in zt[:30]]
+        for c in sample:
+            try:
+                days = {d["date"].replace("-", ""): d for d in Q.tx_days(c)}
+                # tx_days date format may be YYYY-MM-DD
+                d = days.get(day) or days.get(f"{day[:4]}-{day[4:6]}-{day[6:]}")
+                if not d: continue
+                # prec is yesterday close relative to that day? For day D minute, prec=D-1 close.
+                # We want D close and D low from day bars if possible — skip if unavailable.
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # 用涨停池当日腾讯行情补昨收（池日收盘价≈涨停价，仅作关注价参考）
+    try:
+        q = {}
+        codes = [r["code"] for r in zt]
+        for i in range(0, len(codes), 60):
+            q.update(Q.tx_quotes([Q.tx_sym(c) for c in codes[i:i + 60]]))
+        for r in zt:
+            t = q.get(Q.tx_sym(r["code"]))
+            if not t: continue
+            # 若行情日期=池日，price 为池日收盘；pre_close 为池日前收
+            tday = (t.get("time") or "")[:10].replace("-", "")
+            if tday == day:
+                watch_px[r["code"]] = {"昨收": t.get("price"), "昨低": t.get("low")}
+            elif t.get("pre_close") is not None and not watch_px.get(r["code"]):
+                watch_px[r["code"]] = {"昨收": t.get("pre_close"), "昨低": None}
+    except Exception as e:
+        log("observe watch_px", e)
+
+    notes = (jload(TRADE_POOL_F, {}) or {}).get("notes") or {}
+    # 若 trade_pool 在内存且同 day，合并 notes
+    tp_mem = get("trade_pool").get("data") or {}
+    if tp_mem.get("day") == day and tp_mem.get("notes"):
+        notes = {**notes, **(tp_mem.get("notes") or {})}
+
+    out = PS.build_observe_pool(
+        zt, stage_mode=stage, tier=sent.get("tier"), sectors=sectors if isinstance(sectors, dict) else None,
+        float_caps=caps, watchlist=read_watch(), user_notes=notes, pool_day=day, position=sent.get("position"))
+    for r in out.get("observe") or []:
+        wp = watch_px.get(r["code"])
+        if wp: r["watch_prices"] = wp
+    out["replay"] = day != now().strftime("%Y%m%d") or phase() == "closed_day"
+    out["phase"] = phase(); out["phase_cn"] = PHASE_CN[phase()]
+    out["zt_count"] = len(zt); out["zt_source"] = src
+    out["float_cap_source"] = "东方财富 ulist f21 流通市值" if caps else "流通市值未取到"
+    out["sectors_meta"] = meta("sectors")
+    put("observe", out, source=f"{src}；板块={meta('sectors').get('source') or '尚未取到'}；流通市值=东财f21；催化默认未核验")
+    # 观察池就绪后，让竞价按「观察池优先」重算
+    au = get("auction").get("data")
+    if au:
+        put("auction", {**au, "stale_for_observe": True, "complete": False}, source=get("auction").get("source"))
+    NEXT["auction"] = 0
+    # rebuild trade pool skeleton
+    tp = PS.merge_trade_pool(day, out, get("auction").get("data"), get("open_confirm").get("data"),
+                             prev=jload(TRADE_POOL_F, {}) or tp_mem)
+    tp["notes"] = notes
+    _persist_trade_pool(tp)
+
+def job_open_confirm():
+    """09:40 开盘确认；休市/盘后用当日分时回放。"""
+    rd = ref_day(); today = now().strftime("%Y%m%d")
+    ph = phase()
+    obs = get("observe").get("data") or {}
+    au = get("auction").get("data") or {}
+    # focus: 竞价可建仓/弱转强/自选 ∪ 观察池
+    codes = []
+    meta_map = {}
+    for r in obs.get("observe") or []:
+        codes.append(r["code"]); meta_map[r["code"]] = {"name": r.get("name"), "buy_point": r.get("planned_buy_point"), "from": "观察池"}
+    for r in au.get("rows") or []:
+        if r.get("conclusion") in ("可建仓",) or r.get("cls") in ("w2s",) or r.get("is_watchlist") or "观察池" in (r.get("src") or []) or "自选" in (r.get("src") or []):
+            codes.append(r["code"])
+            meta_map.setdefault(r["code"], {"name": r.get("name"), "buy_point": r.get("buy_point"), "from": "竞价"})
+            meta_map[r["code"]]["name"] = meta_map[r["code"]].get("name") or r.get("name")
+            if r.get("buy_point") and r.get("buy_point") != "—":
+                meta_map[r["code"]]["buy_point"] = r.get("buy_point")
+    for c in watch_codes():
+        codes.append(c); meta_map.setdefault(c, {"name": c, "buy_point": "—", "from": "自选"})
+    # unique preserve order
+    seen = set(); uniq = []
+    for c in codes:
+        if c in seen: continue
+        seen.add(c); uniq.append(c)
+    uniq = uniq[:25]  # 控制拉取量
+    if not uniq:
+        put("open_confirm", {"day": rd, "rows": [], "note": "无重点股可确认", "replay": rd != today}, source="—")
+        return
+
+    live_ok = ph in ("am", "pm", "noon") and today == rd and (now().hour * 100 + now().minute) >= 940
+    replay = not live_ok
+    if ph in ("pre", "auction_call", "auction_done") and today == rd:
+        cur = get("open_confirm").get("data") or {}
+        put("open_confirm", {**cur, "day": rd, "note": "09:40（北京时间）后给出开盘确认；当前尚未到点",
+                             "rows": cur.get("rows") if cur.get("day") == rd else [], "replay": False, "pending": True},
+            source=get("open_confirm").get("source") or "待 09:40")
+        return
+
+    rows = []
+    def one(c):
+        info = meta_map.get(c) or {"name": c, "buy_point": "—"}
+        try:
+            days = {d["date"].replace("-", ""): d for d in Q.tx_days(c)}
+            # also index with dashes
+            for k in list(days):
+                if "-" in k: days[k.replace("-", "")] = days[k]
+            d = days.get(rd)
+            if not d or not d.get("data"):
+                return {**info, "code": c, "conclusion": "未取到", "conclusion_cls": "na", "reason": "当日无分时（停牌？）", "replay": replay}
+            yest = days.get(prev_trade_day(rd))
+            pre = Q.num(d.get("prec"))
+            verdict = PS.open_confirm_from_minutes(
+                c, info.get("name") or c, d["data"], pre=pre,
+                yest_bars=(yest or {}).get("data"), buy_point=info.get("buy_point"), replay=replay)
+            verdict["from"] = info.get("from")
+            return verdict
+        except Exception as e:
+            return {"code": c, "name": info.get("name") or c, "conclusion": "未取到", "conclusion_cls": "na",
+                    "reason": f"{type(e).__name__}: {e}"[:160], "buy_point": info.get("buy_point"), "replay": replay}
+    with ThreadPoolExecutor(6) as ex:
+        rows = list(ex.map(one, uniq))
+    order = {"yes": 0, "hold": 1, "no": 2, "na": 3}
+    rows.sort(key=lambda x: order.get(x.get("conclusion_cls"), 9))
+    out = {"day": rd, "rows": rows, "replay": replay, "pending": False,
+           "summary": {"n": len(rows),
+                       "can_buy": sum(1 for x in rows if x.get("conclusion") == "可建仓"),
+                       "hold": sum(1 for x in rows if "继续观察" in (x.get("conclusion") or "")),
+                       "no": sum(1 for x in rows if x.get("conclusion") == "不可建仓")},
+           "note": ("回放：用该日 09:30-09:40 分时" if replay else "实时：开盘约10分钟确认")}
+    put("open_confirm", out, source="腾讯分时 web.ifzq.gtimg.cn（09:30-09:40 窗口）")
+    tp = PS.merge_trade_pool(last_close_day() if replay and phase() == "closed_day" else rd,
+                             get("observe").get("data"), get("auction").get("data"), out,
+                             prev=jload(TRADE_POOL_F, {}) or get("trade_pool").get("data") or {})
+    _persist_trade_pool(tp)
+
 # ---------------- poller ----------------
 JOBS = {  # name: (fn, live_interval_s, idle_interval_s)
     "spot": (job_spot, 10, 300), "index": (job_index, 15, 600), "limitup": (job_limitup, 60, 1800),
     "breadth": (job_breadth, 60, 1800), "minutes": (job_minutes, 30, 900), "prevpools": (job_prevpools, 300, 1800),
-    "auction": (job_auction, 15, 900),
+    "sectors": (job_sectors, 90, 600), "observe": (job_observe, 120, 900),
+    "auction": (job_auction, 15, 900), "open_confirm": (job_open_confirm, 60, 900),
 }
 NEXT = {k: 0 for k in JOBS}; RUNNING = set(); LASTRUN = {}
-POOLX = ThreadPoolExecutor(4)
+POOLX = ThreadPoolExecutor(5)
 def interval(name):
     fn, li, idle = JOBS[name]; ph = phase()
     if name == "auction":
         if ph == "auction_done": return 15
         if ph in ("am",): return 60
+        return idle
+    if name == "open_confirm":
+        if ph == "am" and now().hour * 100 + now().minute < 1000: return 30
+        if ph in ("am", "pm"): return 120
+        return idle
+    if name == "sectors":
+        if ph in ("am", "pm"): return 90
+        return idle
+    if name == "observe":
+        if ph in ("pre",): return 180
         return idle
     if ph in ("auction_call", "auction_done", "am", "pm"): return li
     if ph == "post": return max(li, 60)
@@ -757,6 +993,10 @@ def poller():
             for name in JOBS:
                 if time.time() >= NEXT[name] and name not in RUNNING:
                     if name == "auction" and not (get("prevpools").get("data")): NEXT[name] = time.time() + 5; continue
+                    if name == "observe" and not (get("limitup").get("data") or get("prevpools").get("data")):
+                        NEXT[name] = time.time() + 5; continue
+                    if name == "open_confirm" and not (get("observe").get("data") or get("auction").get("data")):
+                        NEXT[name] = time.time() + 5; continue
                     with LOCK: RUNNING.add(name)
                     NEXT[name] = time.time() + interval(name)
                     POOLX.submit(run_job, name)
@@ -886,6 +1126,70 @@ def api_sentiment():
     return {"sent": sentiment(), "index": {**meta("index"), "data": get("index").get("data")}, "limitup": meta("limitup"),
             "breadth": meta("breadth"), "prevpools": meta("prevpools"), "now": nows(), "phase_cn": PHASE_CN[phase()]}
 
+@app.get("/api/pool")
+def api_pool():
+    """选股入池全景：情绪/主线/观察池/竞价重点/开盘确认/交易池。"""
+    sent = sentiment()
+    obs = get("observe").get("data")
+    au = get("auction").get("data") or {}
+    oc = get("open_confirm").get("data")
+    tp = get("trade_pool").get("data") or jload(TRADE_POOL_F, None)
+    # 竞价重点：观察池∪自选优先排序
+    focus = []
+    if au.get("rows"):
+        obs_codes = {r["code"] for r in (obs or {}).get("observe") or []}
+        wl = set(watch_codes())
+        rows = list(au["rows"])
+        def rank(r):
+            c = r.get("code")
+            pri = 0 if c in obs_codes else (1 if c in wl or r.get("is_watchlist") else 2)
+            return (pri, {"yes": 0, "watch": 1, "hold": 2, "no": 3, "na": 4}.get(r.get("conclusion_cls"), 9))
+        rows.sort(key=rank)
+        focus = rows
+    return {
+        "now": nows(), "phase": phase(), "phase_cn": PHASE_CN[phase()], "ref_day": ref_day(),
+        "last_close_day": last_close_day(),
+        "sent": {"tier": sent.get("tier"), "stage_mode": sent.get("stage_mode"), "position": sent.get("position"),
+                 "one_line": sent.get("one_line"), "must_empty": sent.get("must_empty"),
+                 "buy_points_active": sent.get("buy_points_active"), "buy_points_paused": sent.get("buy_points_paused"),
+                 "date": sent.get("date")},
+        "sectors": {**meta("sectors"), "data": get("sectors").get("data")},
+        "observe": {**meta("observe"), "data": obs},
+        "w2s_candidates": (obs or {}).get("w2s_candidates") if obs else None,
+        "auction_focus": focus, "auction": meta("auction"),
+        "open_confirm": {**meta("open_confirm"), "data": oc},
+        "trade_pool": {**meta("trade_pool"), "data": tp},
+        "disclaimer": "公开网页行情，非 Level-2；催化/解禁/监管默认未核验；仅供研究参考，不构成投资建议",
+    }
+
+@app.post("/api/pool/note")
+async def api_pool_note(req: Request):
+    """用户标注：催化已核验 / 剔除 / 置顶。"""
+    b = await req.json()
+    code = str(b.get("code", "")).strip()
+    if not valid_code(code): raise HTTPException(400, "代码须为6位数字")
+    action = (b.get("action") or "").strip()
+    if action not in ("催化已核验", "剔除", "置顶", "取消置顶", "取消剔除", "clear"):
+        raise HTTPException(400, "action 仅支持：催化已核验 / 剔除 / 置顶 / 取消置顶 / 取消剔除 / clear")
+    with LOCK:
+        tp = jload(TRADE_POOL_F, {}) or get("trade_pool").get("data") or {"day": last_close_day(), "notes": {}}
+        notes = dict(tp.get("notes") or {})
+        cur = dict(notes.get(code) or {})
+        if action == "催化已核验": cur["catalytic_verified"] = True
+        elif action == "剔除": cur["action"] = "剔除"
+        elif action == "置顶": cur["pin"] = True
+        elif action == "取消置顶": cur.pop("pin", None)
+        elif action == "取消剔除":
+            if cur.get("action") == "剔除": cur.pop("action", None)
+        elif action == "clear": cur = {}
+        cur["updated_at"] = nows()
+        if cur: notes[code] = cur
+        else: notes.pop(code, None)
+        tp["notes"] = notes; tp["day"] = tp.get("day") or last_close_day()
+        _persist_trade_pool(tp)
+    NEXT["observe"] = 0
+    return {"ok": True, "code": code, "note": notes.get(code)}
+
 
 @app.get("/api/chart/{code}")
 def api_chart(code: str, kind: str = "minute", n: int = 60):
@@ -927,9 +1231,44 @@ def _fc_quote(code):
     r = ((get("spot").get("data") or {}).get("rows") or {}).get(code)
     if r: return r
     return Q.tx_quotes([Q.tx_sym(code)]).get(Q.tx_sym(code))
+def _fc_selection():
+    obs = get("observe").get("data") or {}
+    tp = get("trade_pool").get("data") or jload(TRADE_POOL_F, {}) or {}
+    sent = sentiment()
+    return {
+        "stage_mode": sent.get("stage_mode"), "tier": sent.get("tier"),
+        "mainlines": [{"industry": m.get("industry"), "zt_n": m.get("zt_n"), "kind": m.get("kind"),
+                       "mainline_ok": m.get("mainline_ok"), "mainline_days": m.get("mainline_days")}
+                      for m in (obs.get("mainlines") or [])],
+        "observe_count": len(obs.get("observe") or []),
+        "observe_codes": [r["code"] for r in (obs.get("observe") or [])],
+        "confirmed": [{"code": r.get("code"), "name": r.get("name"), "buy_point": r.get("buy_point"),
+                       "conclusion": r.get("conclusion")} for r in (tp.get("confirmed") or [])],
+        "pool_day": obs.get("day") or tp.get("day"),
+    }
+def _fc_pool_context(code):
+    obs = get("observe").get("data") or {}
+    au = get("auction").get("data") or {}
+    oc = get("open_confirm").get("data") or {}
+    o = next((x for x in (obs.get("observe") or []) if x.get("code") == code), None)
+    a = next((x for x in (au.get("rows") or []) if x.get("code") == code), None)
+    c = next((x for x in (oc.get("rows") or []) if x.get("code") == code), None)
+    if not (o or a or c): return None
+    return {
+        "theme": (o or {}).get("theme") or (o or {}).get("industry") or (a or {}).get("theme"),
+        "industry": (o or {}).get("industry") or (a or {}).get("industry"),
+        "planned_buy_point": (o or {}).get("planned_buy_point") or (a or {}).get("buy_point"),
+        "observe_conclusion": (o or {}).get("conclusion_for_observe"),
+        "auction_conclusion": (a or {}).get("conclusion"),
+        "auction_reason": (a or {}).get("reason"),
+        "open_conclusion": (c or {}).get("conclusion"),
+        "open_reason": (c or {}).get("reason"),
+        "pool_day": obs.get("day"),
+    }
 app.include_router(_fc_router({"get": get, "ref_day": ref_day, "em_label": P.EM_LABEL, "sentiment": sentiment, "data_dir": DATA,
                                "quote": _fc_quote, "valid_code": valid_code, "board_of": board_of, "nows": nows,
-                               "today": lambda: now().strftime("%Y%m%d")}))
+                               "today": lambda: now().strftime("%Y%m%d"),
+                               "selection": _fc_selection, "pool_context": _fc_pool_context}))
 PUBLIC.add(_FC_INGEST)   # ingest has its own X-Ingest-Token (constant-time compare); everything else under /fivecore needs ACCESS_TOKEN
 
 def seed_watch_from_env():
@@ -949,5 +1288,9 @@ def _start():
     if not os.path.exists(RULES_F): jsave(RULES_F, [])
     try: seed_watch_from_env()
     except Exception as e: log("seed fail", e)
+    try:
+        tp = jload(TRADE_POOL_F, None)
+        if tp: put("trade_pool", tp, source="启动加载 trade_pool.json")
+    except Exception as e: log("trade_pool load fail", e)
     threading.Thread(target=poller, daemon=True).start()
     log("started; token from", "env ACCESS_TOKEN" if os.environ.get("ACCESS_TOKEN") else TOKEN_F, "data", DATA)
