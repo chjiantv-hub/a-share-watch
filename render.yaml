@@ -15,3 +15,5 @@ services:
         sync: false
       - key: DATA_DIR
         value: /data
+      - key: FIVECORE_INGEST_TOKEN   # optional: enables /fivecore/api/ingest/market for a future licensed feed
+        sync: false

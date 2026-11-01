@@ -921,6 +921,17 @@ def api_chart(code: str, kind: str = "minute", n: int = 60):
     out = dict(payload); out["cached"] = False; out["fetched_at"] = nows()
     return out
 
+# ---------------- FiveCore 五核智选 (/fivecore/, same ACCESS_TOKEN) ----------------
+from fivecore.web import create_router as _fc_router, INGEST_PATH as _FC_INGEST  # noqa: E402
+def _fc_quote(code):
+    r = ((get("spot").get("data") or {}).get("rows") or {}).get(code)
+    if r: return r
+    return Q.tx_quotes([Q.tx_sym(code)]).get(Q.tx_sym(code))
+app.include_router(_fc_router({"get": get, "ref_day": ref_day, "em_label": P.EM_LABEL, "sentiment": sentiment, "data_dir": DATA,
+                               "quote": _fc_quote, "valid_code": valid_code, "board_of": board_of, "nows": nows,
+                               "today": lambda: now().strftime("%Y%m%d")}))
+PUBLIC.add(_FC_INGEST)   # ingest has its own X-Ingest-Token (constant-time compare); everything else under /fivecore needs ACCESS_TOKEN
+
 def seed_watch_from_env():
     """WATCHLIST_SEED="600000,000001" (optional): fill an empty watchlist on first boot, so personal picks need not live in the repo/image."""
     codes = [c.strip() for c in re.split(r"[,\s;]+", os.environ.get("WATCHLIST_SEED", "")) if valid_code(c.strip())]

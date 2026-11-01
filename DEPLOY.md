@@ -49,3 +49,10 @@
 ## 注意
 - 云端的自选股是 `/data/watchlist.md` 独立副本，与本机 `/workspace/a-share-pool/watchlist.md`（盘前/竞价例行任务读的那份）不再自动同步。
 - 大陆可达性随运营商/时段变化，部署后请用手机流量和 WiFi 各打开一次确认。
+
+
+## 五核智选 FiveCore（/fivecore/）
+- 内嵌在本服务中，地址 `/fivecore/?t=<ACCESS_TOKEN>`，与盯盘共用同一访问令牌（中间件 + 常数时间比较）。
+- 行情直接取自本进程缓存（腾讯 / 东方财富 / 同花顺备用 / 乐咕），标记 `public_web_unlicensed`；缺失字段为 null，页面显示「未取到」。
+- 外部授权行情写入：`POST /fivecore/api/ingest/market`，请求头 `X-Ingest-Token`；需设置环境变量 `FIVECORE_INGEST_TOKEN`（未设置则写入接口关闭）。`data_quality` 以 `licensed` 开头时优先使用。
+- 测试：`pip install pytest httpx && python -m pytest -q tests`
