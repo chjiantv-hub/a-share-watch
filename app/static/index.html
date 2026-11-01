@@ -104,15 +104,28 @@ details summary::-webkit-details-marker{display:none}
 .chart-box canvas{width:100%;height:100%;display:block;touch-action:none}
 .chart-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--mut);pointer-events:none}
 .stock{grid-template-columns:1fr auto;align-items:start}
+
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.grok-chip{display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:3px 8px;border-radius:999px;background:#263142;color:var(--mut);margin-left:8px;font-weight:600}
+.grok-chip.off{background:#2a2210;color:var(--warn)}
+.grok-chip.on{background:#12301f;color:#5fe29a}
+#grokbox{position:fixed;left:10px;right:10px;bottom:calc(64px + env(safe-area-inset-bottom));z-index:14;max-height:55vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.55);display:none;padding:12px}
+#grokbox .gh{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px}
+#grokbox .gh b{font-size:15px}
+#grokbox .body{font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+#grokbox .body h2, #grokbox .body .h{font-size:14px;font-weight:800;margin:10px 0 4px;color:var(--acc)}
+#grokbox .err{color:var(--warn)}
+#grokbox .mut{font-size:11px;color:var(--mut);margin-top:8px}
 </style></head>
 <body>
 <header>
-  <div class="top"><h1>A股盯盘</h1><div id="hdr-r">—</div></div>
+  <div class="top"><h1>A股盯盘 <span id="grokchip" class="grok-chip off" title="Grok">Grok…</span></h1><div id="hdr-r">—</div></div>
   <div id="sticky"></div>
 </header>
 <div id="toast"></div>
 <main id="main"><div class="loading">加载中…</div></main>
 <footer>仅供参考，不构成投资建议 · 非 Level-2 行情</footer>
+<div id="grokbox"></div>
 <nav id="nav"></nav>
 <script>
 const TABS=[["watch","自","自选"],["alerts","铃","提醒"],["limit","板","涨停"],["pool","选","选股"],["auction","竞","竞价"],["sent","情","情绪"]];
@@ -132,8 +145,59 @@ function meta(m,extra=''){ if(!m) return '';
   return s;}
 async function api(path,opt={}){opt.headers=Object.assign({'X-Token':TK,'Content-Type':'application/json'},opt.headers||{});
   const r=await fetch(path,opt); if(!r.ok){let t=await r.text();try{t=JSON.parse(t).detail||t}catch(e){} throw new Error(t)} return r.json();}
+
+/* ---------- Grok 解读 ---------- */
+let GROK={configured:false,model:''};
+function setGrokChip(){
+  const el=$('#grokchip'); if(!el) return;
+  if(GROK.configured){ el.className='grok-chip on'; el.textContent='Grok就绪'; el.title=GROK.model||''; }
+  else { el.className='grok-chip off'; el.textContent='Grok未配置'; el.title='设置环境变量 XAI_API_KEY 后生效'; }
+}
+async function loadGrokStatus(){
+  try{ const s=await api('/api/grok/status'); GROK={configured:!!s.configured, model:s.model||''}; }
+  catch(e){ GROK={configured:false,model:''}; }
+  setGrokChip();
+}
+function grokBtn(code){
+  const dis=GROK.configured?'':' disabled';
+  const tip=GROK.configured?'':' title="Grok 未配置：需设置 XAI_API_KEY"';
+  return `<button class="btn mini sec"${dis}${tip} onclick="event.stopPropagation();grokExplain('stock','${code}')">Grok解读</button>`;
+}
+function grokMarketBtn(){
+  const dis=GROK.configured?'':' disabled';
+  const tip=GROK.configured?'':' title="Grok 未配置：需设置 XAI_API_KEY"';
+  return `<button class="btn sec sm"${dis}${tip} onclick="grokExplain('market')">Grok解读盘面</button>`;
+}
+function closeGrok(){ const b=$('#grokbox'); if(b){ b.style.display='none'; b.innerHTML=''; } }
+function renderGrokMd(text){
+  return String(text||'').split(/\n/).map(line=>{
+    const m=line.match(/^##\s+(.+)/);
+    if(m) return `<div class="h">${esc(m[1])}</div>`;
+    return esc(line)||' ';
+  }).join('\n');
+}
+function showGrokBox(html){ const b=$('#grokbox'); b.style.display='block'; b.innerHTML=html; }
+async function grokExplain(scope, code){
+  if(!GROK.configured){ toast('Grok 未配置：请在云端环境变量设置 XAI_API_KEY'); showGrokBox(`<div class="gh"><b>Grok解读</b><button class="btn mini sec" onclick="closeGrok()">关闭</button></div><div class="body err">Grok 未配置。在 Render/ClawCloud 设置 <b>XAI_API_KEY</b> 后 Manual Deploy；密钥不会下发到手机。</div>`); return; }
+  showGrokBox(`<div class="gh"><b>Grok解读中…</b><button class="btn mini sec" onclick="closeGrok()">关闭</button></div><div class="body mut">正在汇总页面缓存上下文并请求 xAI（约数十秒）…</div>`);
+  try{
+    const body={scope}; if(scope==='stock') body.code=code;
+    const r=await api('/api/grok/explain',{method:'POST',body:JSON.stringify(body)});
+    if(!r.ok){
+      showGrokBox(`<div class="gh"><b>Grok解读</b><button class="btn mini sec" onclick="closeGrok()">关闭</button></div>
+        <div class="body err">${esc(r.error||'失败')}</div>
+        <div class="mut">${esc(r.model||'')} · ${esc(r.at||'')}</div>`);
+      return;
+    }
+    showGrokBox(`<div class="gh"><b>Grok解读${scope==='market'?' · 盘面':(' · '+(code||''))}</b><button class="btn mini sec" onclick="closeGrok()">关闭</button></div>
+      <div class="body">${renderGrokMd(r.text)}</div>
+      <div class="mut">${esc(r.model||'')} · ${esc(r.at||'')} · ${(r.elapsed_ms!=null)?(r.elapsed_ms+'ms'):''}<br>上下文：${esc((r.used_context_keys||[]).join(', '))}</div>`);
+  }catch(e){
+    showGrokBox(`<div class="gh"><b>Grok解读</b><button class="btn mini sec" onclick="closeGrok()">关闭</button></div><div class="body err">${esc(e.message)}</div>`);
+  }
+}
 function nav(){ $('#nav').innerHTML=TABS.map(t=>`<button class="${t[0]==TAB?'on':''}" onclick="go('${t[0]}')"><b>${t[1]}</b>${t[2]}</button>`).join('');}
-function go(t){TAB=t;location.hash=t;nav();render(true);window.scrollTo(0,0)}
+function go(t){TAB=t;location.hash=t;nav();loadGrokStatus();render(true);window.scrollTo(0,0)}
 let busy=false, stickyCache='';
 function setSticky(html){ stickyCache=html||''; const el=$('#sticky'); if(html){el.style.display='block';el.innerHTML=html} else {el.style.display='none';el.innerHTML=''} }
 async function render(force){ if(busy&&!force) return; busy=true;
@@ -155,7 +219,8 @@ async function rWatch(){
       <div class="sub">涨停 ${q?f(q.limit_up):NA} · 跌停 ${q?f(q.limit_down):NA} · 开${q?f(q.open):NA} 高${q?f(q.high):NA} 低${q?f(q.low):NA}</div>
       <div class="sub">行情时间 ${q?esc(q.time):NA}</div></div>
       <div class="px"><div class="big ${q?cls(q.pct):''}">${q?f(q.price):NA}</div><div class="num" style="font-size:15px;font-weight:700">${q?pct(q.pct):''}</div>
-      <button class="btn sec sm" style="margin-top:6px" onclick="delW('${it.code}')">移除</button></div>
+      <button class="btn sec sm" style="margin-top:6px" onclick="delW('${it.code}')">移除</button>
+      <div style="margin-top:6px">${grokBtn(it.code)}</div></div>
       <div class="chart-wrap">
         <div class="chart-hd">
           <div class="chart-seg">
@@ -295,7 +360,8 @@ async function rSent(){
     <div class="sub">交易日 ${esc(s.date||'—')} · ${esc(d.phase_cn)}</div>`);
   let h='';
   if(s.must_empty) h+=`<div class="banner">必须空仓<br>${(s.must_empty_reasons||[]).map(esc).join('<br>')}</div>`;
-  h+=`<div class="one"><div class="t">${esc(s.one_line||'—')}</div><div class="p">${esc(s.why||'')}</div></div>`;
+  h+=`<div class="one"><div class="t">${esc(s.one_line||'—')}</div><div class="p">${esc(s.why||'')}</div>
+    <div style="margin-top:10px">${grokMarketBtn()}</div></div>`;
   h+=`<div class="card"><h2>情绪档位 · 阶段模式</h2>
    <div class="tier ${tc}" style="${s.tier=='修复'?'color:var(--warn)':''}">${esc(s.tier)}</div>
    <div style="margin-top:6px;font-size:15px;font-weight:700">${esc(s.stage_mode||'—')}</div>
@@ -509,7 +575,8 @@ async function rPool(){
   h+=`<div class="one"><div class="t">${esc(s.tier||'—')} · ${esc(s.stage_mode||'—')} · 仓位 ${esc((s.position&&s.position.total)||'—')}</div>
     <div class="p">主线：${mains.length?mains.map(m=>esc(m.industry)+'('+m.zt_n+')'+(m.kind&&m.kind!=='主线'?'·'+esc(m.kind):'')).join('、'):'未识别'}
     ${(obs&&obs.mainline_note)?'<br>'+esc(obs.mainline_note):''}
-    ${(obs&&obs.sector_inflow_note)?'<br>'+esc(obs.sector_inflow_note):''}</div></div>`;
+    ${(obs&&obs.sector_inflow_note)?'<br>'+esc(obs.sector_inflow_note):''}</div>
+    <div style="margin-top:10px">${grokMarketBtn()}</div></div>`;
   h+=`<div class="card"><div class="seg">${[['pre','盘前'],['auc','竞价'],['cfm','确认'],['in','入池']].map(t=>`<button class="${PSEG==t[0]?'on':''}" onclick="PSEG='${t[0]}';render(true)">${t[1]}</button>`).join('')}</div>`;
 
   if(PSEG==='pre'){
@@ -525,7 +592,7 @@ async function rPool(){
         <div style="margin-top:4px"><span class="tag t-${cc}">${esc(r.conclusion_for_observe)}</span>
         ${r.planned_buy_point&&r.planned_buy_point!=='—'?'<span class="tag">'+esc(r.planned_buy_point)+'</span>':''}
         ${r.lanban?'<span class="tag t-watch">烂板/尾盘</span>':''}</div></div>
-        <div>${fcLink(r.code)}</div></div>
+        <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">${fcLink(r.code)}${grokBtn(r.code)}</div></div>
         ${catHtml(r.catalyst, r.pass_flags&&r.pass_flags.catalytic, r.pass_flags&&r.pass_flags.catalytic_kind)}
         <div class="c" style="margin-top:6px">关注价：昨收 ${(r.watch_prices&&r.watch_prices['昨收'])??'未取到'} · 昨低 ${(r.watch_prices&&r.watch_prices['昨低'])??'未取到'}
         · 市值 ${(r.pass_flags&&r.pass_flags.float_cap_yi)!=null?r.pass_flags.float_cap_yi+'亿':(r.pass_flags&&r.pass_flags.cap_ok==='unknown'?'未知':'—')}</div>
@@ -541,14 +608,14 @@ async function rPool(){
     if(!w2s.length) h+=`<div class="empty">无（需主线/新方向下昨日首板烂板或尾盘板）</div>`;
     else h+=w2s.map(r=>`<div class="acard hold"><div class="hd"><div><div class="name">${esc(r.name)} <span class="c">${r.code}</span></div>
       <div class="c">${esc(r.theme)} · ${esc(r.industry)} · 额 ${r.amount_yi??'—'}亿 · 炸 ${r.zb_times??0}</div>
-      <div class="reason">${esc(r.note||'')}</div></div>${fcLink(r.code)}</div></div>`).join('');
+      <div class="reason">${esc(r.note||'')}</div></div><div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">${fcLink(r.code)}${grokBtn(r.code)}</div></div></div>`).join('');
     h+=`<h2 style="font-size:15px;margin:14px 0 6px">自选（独立跟踪）</h2>`;
     const wl=obs.watchlist||[];
     if(!wl.length) h+=`<div class="empty">暂无自选</div>`;
     else h+=wl.map(w=>`<div class="stock"><div><span class="nm">${esc(w.name)}</span> <span class="sub">${w.code}</span>
       ${w.in_observe?'<span class="tag t-w2s">在观察池</span>':'<span class="tag t-hold">未入观察池</span>'}
       ${w.planned_buy_point&&w.planned_buy_point!=='—'?'<span class="tag">'+esc(w.planned_buy_point)+'</span>':''}
-      <div class="sub">${esc(w.observe_conclusion||'—')} · ${esc(w.board||'')}</div></div>${fcLink(w.code)}</div>`).join('');
+      <div class="sub">${esc(w.observe_conclusion||'—')} · ${esc(w.board||'')}</div></div><div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">${fcLink(w.code)}${grokBtn(w.code)}</div></div>`).join('');
     const rej=obs.rejected||[];
     h+=`<details style="margin-top:12px"><summary>已剔除 / 未入选（${rej.length}）</summary>`;
     h+=rej.slice(0,40).map(r=>`<div class="ev"><div class="t">${esc(r.code)}</div><div><b>${esc(r.name||'')}</b> · ${esc(r.industry||'')}<div class="c">${esc((r.reasons||[]).filter(Boolean).join('；'))}</div>${r.catalyst?catHtml(r.catalyst):''}</div></div>`).join('')||`<div class="empty">无</div>`;
@@ -574,7 +641,7 @@ async function rPool(){
           <div class="pct ${cls(r.pct)}">${r.pct==null?'—':((r.pct>0?'+':'')+Number(r.pct).toFixed(2)+'%')}</div></div>
           <div class="reason">${esc(r.reason||'')}</div>
           ${r.catalyst?catHtml(r.catalyst):''}
-          <div style="margin-top:6px">${fcLink(r.code)}</div></div>`;
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${fcLink(r.code)}${grokBtn(r.code)}</div></div>`;
       }).join('');
       h+=`<button class="btn sec more" onclick="go('auction')">打开完整竞价页</button></div>`;
     }
@@ -598,7 +665,7 @@ async function rPool(){
           <div class="c" style="margin-top:6px">开${m.open??'—'} · 09:40 ${m.last_0940??'—'} · 高${m.high??'—'} · 量较昨 ${m.vol_vs_yest??'未取到'}</div>
           <div class="reason">${esc(r.reason||'')}</div>
           ${r.catalyst?catHtml(r.catalyst):''}
-          <div style="margin-top:6px">${fcLink(r.code)}</div></div>`;
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${fcLink(r.code)}${grokBtn(r.code)}</div></div>`;
       }).join('')||`<div class="empty">无重点股</div>`;
       h+=`${meta(d.open_confirm)}</div>`;
     }
@@ -611,7 +678,7 @@ async function rPool(){
     h+=`<h2 style="font-size:15px;margin:8px 0 6px">确认可建仓（${conf.length}）</h2>`;
     if(!conf.length) h+=`<div class="empty">暂无（需 09:40 确认通过）</div>`;
     else h+=conf.map(r=>`<div class="acard yes"><div class="hd"><div><div class="name">${esc(r.name)} <span class="c">${r.code}</span></div>
-      <div class="c">${esc(r.buy_point||'—')}</div><div class="reason">${esc(r.reason||'')}</div></div>${fcLink(r.code)}</div></div>`).join('');
+      <div class="c">${esc(r.buy_point||'—')}</div><div class="reason">${esc(r.reason||'')}</div></div><div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">${fcLink(r.code)}${grokBtn(r.code)}</div></div></div>`).join('');
     h+=`<h2 style="font-size:15px;margin:14px 0 6px">竞价重点（${focus.length}）</h2>`;
     if(!focus.length) h+=`<div class="empty">暂无</div>`;
     else h+=focus.map(r=>`<div class="acard hold"><div class="name">${esc(r.name)} <span class="c">${r.code}</span>

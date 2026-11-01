@@ -14,6 +14,7 @@ import quotes as Q                                   # noqa: E402
 import pools as P                                    # noqa: E402
 import pool_select as PS                             # noqa: E402
 import catalyst as CATM                              # noqa: E402
+import grok_explain as GROK                       # noqa: E402
 sys.argv = _argv
 import requests                                      # noqa: E402
 from fastapi import FastAPI, Request, HTTPException  # noqa: E402
@@ -1280,6 +1281,36 @@ def api_chart(code: str, kind: str = "minute", n: int = 60):
         _chart_cache_put(ck, payload, ttl)
     out = dict(payload); out["cached"] = False; out["fetched_at"] = nows()
     return out
+
+# ---------------- Grok 解读（xAI；密钥仅环境变量） ----------------
+@app.get("/api/grok/status")
+def api_grok_status():
+    return {**GROK.status(), "at": nows()}
+
+@app.post("/api/grok/explain")
+async def api_grok_explain(req: Request):
+    """用页面已有缓存上下文调用 xAI Grok；未配置密钥时返回明确中文提示，不访问外网。"""
+    try:
+        b = await req.json()
+    except Exception:
+        b = {}
+    scope = str((b or {}).get("scope") or "").strip().lower()
+    code = str((b or {}).get("code") or "").strip() or None
+    obs = get("observe").get("data") or {}
+    cat_day = obs.get("day") or last_close_day()
+    def _peek(day, c):
+        if not CAT_ENABLED: return None
+        try: return CAT.peek(day, c)
+        except Exception: return None
+    def _tp_load():
+        return jload(TRADE_POOL_F, {}) or {}
+    result = GROK.explain(
+        scope=scope, code=code, get=get, sentiment=sentiment, read_watch=read_watch,
+        cat_peek=_peek, cat_day=cat_day, trade_pool_file_load=_tp_load,
+        nows=nows, phase_cn=PHASE_CN[phase()], ref_day=ref_day(), last_close_day=last_close_day(),
+    )
+    # 未配置 / 忙 / 参数错误 → 200 + ok=false（便于前端展示）；HTTP 层鉴权仍由中间件负责
+    return result
 
 # ---------------- FiveCore 五核智选 (/fivecore/, same ACCESS_TOKEN) ----------------
 from fivecore.web import create_router as _fc_router, INGEST_PATH as _FC_INGEST  # noqa: E402

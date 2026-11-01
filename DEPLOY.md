@@ -8,6 +8,8 @@
 | `PORT` | 8080 | 监听端口 |
 | `DATA_DIR` | /data | rules.json、alert_log.json、watchlist.md、行情缓存。首次启动从 `seed/watchlist.md`（仓库里是空表）复制 |
 | `WATCHLIST_SEED` | 空 | 可选，如 `002343,600838,301520`：自选为空时启动即填入（个人自选不进公开仓库/镜像） |
+| `XAI_API_KEY` | 空 | **可选**。xAI API Key（[console.x.ai](https://console.x.ai/)）。未设置时服务照常启动，`/api/grok/*` 返回「Grok 未配置」，前端按钮禁用。密钥仅存环境变量，不下发前端。 |
+| `XAI_MODEL` | `grok-4.20-0309-non-reasoning` | 可选。xAI Chat Completions 模型 ID；默认取文档中的非推理快速档（适合结构化中文解读，相对便宜）。可改为 `grok-4.3` 等。 |
 
 `/healthz` 无需令牌（给保活/健康检查用），其余页面和接口都要令牌（`?t=`、Cookie 或 `X-Token`）。
 
@@ -69,3 +71,12 @@
 - 缓存：`$DATA_DIR/catalyst/<池日>/<代码>.json`；成功 3 小时、失败 10 分钟后重抓。`job_observe` 最多等待 8 秒，其余后台完成后自动重建观察池；`/api/pool` 只读缓存，不阻塞。
 - 接口：`GET /api/catalyst/{code}?day=YYYYMMDD` 返回全部条目；`/api/diag` 含各来源成功/失败计数。环境变量 `CATALYST_FETCH=0` 可关闭。
 - 可达性：本机（非新加坡）实测四个来源均可用。Render 新加坡节点曾访问东财 push2 行情接口失败，公告接口为不同主机，是否可用以 `/api/diag` 的 `catalyst.sources` 为准；失败时会自动回落到巨潮/新浪。
+
+## Grok 行情解读（xAI）
+- 模块 `app/grok_explain.py`。后端调用 `POST https://api.x.ai/v1/chat/completions`（OpenAI 兼容）；**密钥只读环境变量 `XAI_API_KEY`，永不写入仓库/镜像/前端**。
+- 未配置密钥：进程正常启动；`GET /api/grok/status` → `{configured:false, model}`；`POST /api/grok/explain` → `{ok:false, error:"Grok 未配置…"}`；页面顶栏显示「Grok未配置」，按钮禁用。
+- 已配置：在「情」页 / 「选」页点「Grok解读盘面」，或在自选/观察池/竞价/确认卡片点「Grok解读」。服务端用当前缓存（情绪、观察池、竞价、开盘确认、交易池、催化、现价）组装 JSON 上下文，要求模型只引用上下文数字，输出「结论 / 依据 / 风险与缺失数据 / 下一步观察点」。超时约 45 秒；同一股票或盘面同时只允许 1 个进行中的请求（防免费实例打爆）。
+- 默认模型：`grok-4.20-0309-non-reasoning`（xAI 文档列出的非推理档；可用 `XAI_MODEL` 覆盖）。按 token 计费，频繁点会消耗额度，请留意 console.x.ai 用量。
+- **启用步骤（有密钥后）**：Render Dashboard → Environment → 添加 `XAI_API_KEY=...`（可选 `XAI_MODEL`）→ Save → **Manual Deploy**。ClawCloud 同理改环境变量后 Restart。无需改代码。
+- 接口：`GET /api/grok/status`；`POST /api/grok/explain` body `{"scope":"stock"|"market","code":"六位可选"}`。鉴权与其它 API 相同（`?t=` / Cookie / `X-Token`）。
+- 测试：`python -m pytest -q tests/test_grok_explain.py`（全部 mock，不访问外网）。

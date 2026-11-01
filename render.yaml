@@ -17,3 +17,7 @@ services:
         value: /data
       - key: FIVECORE_INGEST_TOKEN   # optional: enables /fivecore/api/ingest/market for a future licensed feed
         sync: false
+      - key: XAI_API_KEY             # optional: enables Grok 解读; leave empty = UI shows 未配置
+        sync: false
+      - key: XAI_MODEL               # optional, default grok-4.20-0309-non-reasoning
+        sync: false
