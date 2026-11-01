@@ -20,11 +20,13 @@ jobs:
         with:
           context: .
           push: true
-          tags: |
-            ${{ steps.n.outputs.cloud }}:latest
-            ${{ steps.n.outputs.cloud }}:${{ github.sha }}
-            ${{ steps.n.outputs.short }}:latest
-            ${{ steps.n.outputs.short }}:${{ github.sha }}
+          tags: ${{ steps.n.outputs.cloud }}:latest,${{ steps.n.outputs.cloud }}:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.title=a-share-watch
+      # Optional alias package (may lack write_package for GITHUB_TOKEN); cloud tag is the deploy source of truth.
+      - name: Also tag ghcr.io/.../a-share-watch:latest
+        continue-on-error: true
+        run: |
+          set -e
+          docker buildx imagetools create             -t ${{ steps.n.outputs.short }}:latest             -t ${{ steps.n.outputs.short }}:${{ github.sha }}             ${{ steps.n.outputs.cloud }}:${{ github.sha }}
