@@ -1049,6 +1049,24 @@ async def auth(request: Request, call_next):
 
 @app.get("/healthz")
 def healthz(): return {"ok": True, "at": nows()}
+
+# xAI relay: lets a mainland instance (no route to api.x.ai) call Grok through this overseas instance.
+# Protected by the same ACCESS_TOKEN middleware; caller supplies its own Authorization: Bearer <xAI key>.
+@app.post("/xai-relay/v1/chat/completions")
+async def xai_relay(request: Request):
+    body = await request.body()
+    authz = request.headers.get("authorization", "")
+    if not authz.lower().startswith("bearer "):
+        return Response('{"error":"missing bearer"}', status_code=400, media_type="application/json")
+    def _go():
+        return requests.post(GROK.XAI_DIRECT_URL, data=body, timeout=60,
+                             headers={"Authorization": authz, "Content-Type": "application/json"})
+    import asyncio
+    try:
+        r = await asyncio.to_thread(_go)
+    except requests.RequestException as e:
+        return Response(json.dumps({"error": f"relay: {type(e).__name__}: {e}"}), status_code=502, media_type="application/json")
+    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
 @app.get("/", response_class=HTMLResponse)
 def index(): return HTMLResponse(open(os.path.join(STATIC, "index.html"), encoding="utf-8").read())
 @app.get("/sw.js")

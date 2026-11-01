@@ -14,7 +14,9 @@ from typing import Any, Callable
 
 import requests
 
-XAI_URL = "https://api.x.ai/v1/chat/completions"
+XAI_DIRECT_URL = "https://api.x.ai/v1/chat/completions"
+# 大陆服务器连不上 api.x.ai 时，设 XAI_URL 为海外实例的中转地址（…/xai-relay/v1/chat/completions），并带 X-Token=ACCESS_TOKEN
+XAI_URL = (os.environ.get("XAI_URL") or XAI_DIRECT_URL).strip()
 DEFAULT_MODEL = "grok-4.20-0309-non-reasoning"
 TIMEOUT_S = 45.0
 MSG_UNCONFIGURED = "Grok 未配置：请在 Render/ClawCloud 环境变量设置 XAI_API_KEY 后重新部署（或 Manual Deploy）。密钥不会出现在前端。"
@@ -307,6 +309,8 @@ def call_xai(messages: list[dict], *, model: str | None = None, key: str | None 
         raise RuntimeError(MSG_UNCONFIGURED)
     model = model or model_name()
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if XAI_URL != XAI_DIRECT_URL and os.environ.get("ACCESS_TOKEN"):
+        headers["X-Token"] = os.environ["ACCESS_TOKEN"].strip()
     body = {
         "model": model,
         "messages": messages,
