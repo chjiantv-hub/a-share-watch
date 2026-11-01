@@ -617,6 +617,112 @@ def sentiment():
                       "prev_lb_avg_pct": prev.get("lb_avg_pct")},
             "breadth": breadth, "ladder": [{"lb": k, "stocks": ladder[k]} for k in sorted(ladder, reverse=True)]}
 
+
+# ---------------- charts (腾讯 ifzq：分时 / 日K) ----------------
+_CHART_CACHE = {}  # key -> (expires_at, payload)
+_CHART_LOCK = threading.Lock()
+
+def _chart_cache_get(key):
+    with _CHART_LOCK:
+        hit = _CHART_CACHE.get(key)
+        if not hit: return None
+        exp, payload = hit
+        if time.time() >= exp:
+            _CHART_CACHE.pop(key, None); return None
+        return payload
+
+def _chart_cache_put(key, payload, ttl):
+    with _CHART_LOCK:
+        _CHART_CACHE[key] = (time.time() + ttl, payload)
+    return payload
+
+def _num(x):
+    try:
+        if x in ("-", "", None): return None
+        return float(x)
+    except Exception:
+        return None
+
+def fetch_minute_chart(code):
+    """腾讯 day/query 分时。bar: HHMM price cumvol cumamt。"""
+    sym = Q.tx_sym(code)
+    r = Q.S.get("https://web.ifzq.gtimg.cn/appstock/app/day/query", params={"code": sym}, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    block = ((j.get("data") or {}).get(sym) or {})
+    days = block.get("data") or []
+    if not days:
+        return {"code": code, "kind": "minute", "day": None, "prec": None, "bars": [],
+                "source": "腾讯 ifzq day/query", "error": "无分时数据"}
+    # 优先当日（交易日），否则取有 bar 的最近交易日（腾讯返回多为新→旧）
+    today = now().strftime("%Y%m%d")
+    day = None
+    for d in days:
+        if d.get("date") == today and d.get("data"):
+            day = d; break
+    if day is None:
+        cands = [d for d in days if d.get("data")]
+        if cands:
+            day = max(cands, key=lambda d: str(d.get("date") or ""))
+    if day is None:
+        return {"code": code, "kind": "minute", "day": None, "prec": None, "bars": [],
+                "source": "腾讯 ifzq day/query", "error": "无分时数据"}
+    prec = _num(day.get("prec"))
+    bars = []
+    prev_vol = 0.0
+    for raw in day["data"]:
+        parts = raw.split()
+        if len(parts) < 2: continue
+        t = parts[0]
+        price = _num(parts[1])
+        if price is None: continue
+        cumvol = _num(parts[2]) if len(parts) > 2 else None
+        vol = None
+        if cumvol is not None:
+            vol = max(0.0, cumvol - prev_vol)
+            prev_vol = cumvol
+        bars.append({"t": t, "p": price, "v": vol})
+    return {"code": code, "kind": "minute", "day": day.get("date"), "prec": prec, "bars": bars,
+            "source": "腾讯 ifzq day/query（web.ifzq.gtimg.cn）", "error": None if bars else "分时为空"}
+
+def fetch_day_chart(code, n=60):
+    """腾讯 fqkline 前复权日K。字段顺序: date, open, close, high, low, volume。"""
+    n = max(5, min(int(n or 60), 250))
+    sym = Q.tx_sym(code)
+    param = f"{sym},day,,,{n},qfq"
+    urls = [
+        ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get", {"param": param}),
+        ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get", {"param": param}),
+    ]
+    last_err = None
+    j = None; src = None
+    for url, params in urls:
+        try:
+            r = Q.S.get(url, params=params, timeout=12)
+            r.raise_for_status()
+            j = r.json()
+            if (j.get("data") or {}).get(sym):
+                src = url.split("/")[2] + " fqkline qfqday"
+                break
+            last_err = f"{url} empty"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            j = None
+    if not j or not (j.get("data") or {}).get(sym):
+        return {"code": code, "kind": "day", "bars": [], "adjust": "qfq", "n": n,
+                "source": "腾讯 fqkline", "error": f"日K未取到（{last_err}）"}
+    block = j["data"][sym]
+    raw = block.get("qfqday") or block.get("day") or []
+    bars = []
+    for row in raw:
+        if not isinstance(row, (list, tuple)) or len(row) < 5: continue
+        d, o, c, h, l = row[0], _num(row[1]), _num(row[2]), _num(row[3]), _num(row[4])
+        v = _num(row[5]) if len(row) > 5 else None
+        if None in (o, c, h, l): continue
+        bars.append({"d": str(d)[:10], "o": o, "h": h, "l": l, "c": c, "v": v})
+    return {"code": code, "kind": "day", "bars": bars, "adjust": "qfq", "n": n,
+            "source": f"腾讯 {src}（前复权）", "error": None if bars else "日K为空"}
+
 # ---------------- poller ----------------
 JOBS = {  # name: (fn, live_interval_s, idle_interval_s)
     "spot": (job_spot, 10, 300), "index": (job_index, 15, 600), "limitup": (job_limitup, 60, 1800),
@@ -779,6 +885,41 @@ def api_auction():
 def api_sentiment():
     return {"sent": sentiment(), "index": {**meta("index"), "data": get("index").get("data")}, "limitup": meta("limitup"),
             "breadth": meta("breadth"), "prevpools": meta("prevpools"), "now": nows(), "phase_cn": PHASE_CN[phase()]}
+
+
+@app.get("/api/chart/{code}")
+def api_chart(code: str, kind: str = "minute", n: int = 60):
+    """分时 / 日K（腾讯公开接口，短缓存）。kind=minute|day。"""
+    code = (code or "").strip()
+    if not valid_code(code):
+        raise HTTPException(400, "代码须为6位数字")
+    kind = (kind or "minute").strip().lower()
+    if kind not in ("minute", "day", "min", "k", "dk"):
+        raise HTTPException(400, "kind 仅支持 minute 或 day")
+    if kind in ("min",): kind = "minute"
+    if kind in ("k", "dk"): kind = "day"
+    n = max(5, min(int(n or 60), 250))
+    ttl = 25 if kind == "minute" else 480
+    ck = f"{kind}:{code}:{n if kind=='day' else ''}"
+    hit = _chart_cache_get(ck)
+    if hit is not None:
+        out = dict(hit); out["cached"] = True; return out
+    try:
+        if kind == "minute":
+            payload = fetch_minute_chart(code)
+        else:
+            payload = fetch_day_chart(code, n)
+    except Exception as e:
+        payload = {"code": code, "kind": kind, "bars": [], "source": "腾讯 ifzq",
+                   "error": f"{type(e).__name__}: {e}"[:200]}
+        if kind == "day":
+            payload["adjust"] = "qfq"; payload["n"] = n
+        if kind == "minute":
+            payload.update({"day": None, "prec": None})
+    if not payload.get("error"):
+        _chart_cache_put(ck, payload, ttl)
+    out = dict(payload); out["cached"] = False; out["fetched_at"] = nows()
+    return out
 
 def seed_watch_from_env():
     """WATCHLIST_SEED="600000,000001" (optional): fill an empty watchlist on first boot, so personal picks need not live in the repo/image."""
